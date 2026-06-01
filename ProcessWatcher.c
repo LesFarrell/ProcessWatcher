@@ -611,7 +611,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         LoadProcessesFromFile();
 
         g_AppData.hwndProcessCombo = CreateWindow(TEXT("COMBOBOX"), TEXT(""),
-                                                  WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+                                                  WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
+                                                      CBS_DROPDOWN | CBS_AUTOHSCROLL,
                                                   10, 10, 200, 200,
                                                   hwnd, (HMENU)IDC_PROCESS_NAME, GetModuleHandle(NULL), NULL);
         PopulateComboBox(g_AppData.hwndProcessCombo);
