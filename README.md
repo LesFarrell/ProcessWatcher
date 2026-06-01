@@ -2,6 +2,8 @@
 
 A lightweight Windows GUI application written in C using the Win32 API to monitor specific processes.
 
+![ProcessWatcher screenshot](screenshot/screenshot.jpg)
+
 ## Features
 
 - Add/remove processes to watch by name or select from combo box dropdown
