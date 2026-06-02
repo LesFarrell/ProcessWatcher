@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <commctrl.h>
@@ -20,6 +21,7 @@
 #define ID_CONTEXT_REMOVE_PROCESS 40001
 #define ID_CONTEXT_END_PROCESS 40002
 #define ID_CONTEXT_TOGGLE_TOPMOST 40003
+#define ID_CONTEXT_OPEN_TASK_MANAGER 40004
 #define IDI_APP_ICON 101
 #define SETTINGS_FILE_NAME "ProcessWatcher.ini"
 
@@ -770,6 +772,29 @@ void EndSelectedProcess(HWND hwndOwner)
     RefreshProcessList(g_AppData.hwndListView);
 }
 
+void OpenSelectedProcessInTaskManager(HWND hwndOwner)
+{
+    int index = GetSelectedProcessIndex();
+    HINSTANCE result;
+
+    if (index == -1 || index >= g_AppData.count)
+        return;
+
+    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
+    {
+        MessageBox(hwndOwner, "The selected process is not currently running.",
+                   "Open in Task Manager", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    result = ShellExecuteA(hwndOwner, "open", "taskmgr.exe", NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32)
+    {
+        MessageBox(hwndOwner, "Failed to open Task Manager.",
+                   "Open in Task Manager", MB_OK | MB_ICONERROR);
+    }
+}
+
 BOOL TrySelectListViewItemAtScreenPoint(HWND hwndListView, POINT screenPoint, int *pIndex)
 {
     LVHITTESTINFO hitTest = {0};
@@ -798,6 +823,7 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     HMENU hMenu;
     UINT removeFlags = MF_STRING;
     UINT endProcessFlags = MF_STRING;
+    UINT openTaskManagerFlags = MF_STRING;
     int command;
 
     if (!hwndListView)
@@ -826,12 +852,17 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     if (IsAutoRefreshEnabled())
         removeFlags |= MF_GRAYED;
     if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
+    {
         endProcessFlags |= MF_GRAYED;
+        openTaskManagerFlags |= MF_GRAYED;
+    }
 
     hMenu = CreatePopupMenu();
     if (!hMenu)
         return FALSE;
 
+    AppendMenu(hMenu, openTaskManagerFlags, ID_CONTEXT_OPEN_TASK_MANAGER, TEXT("Open Task Manager"));
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, removeFlags, ID_CONTEXT_REMOVE_PROCESS, TEXT("Remove Selected"));
@@ -839,7 +870,9 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
                              0, hwndOwner, NULL);
     DestroyMenu(hMenu);
 
-    if (command == ID_CONTEXT_END_PROCESS)
+    if (command == ID_CONTEXT_OPEN_TASK_MANAGER)
+        OpenSelectedProcessInTaskManager(hwndOwner);
+    else if (command == ID_CONTEXT_END_PROCESS)
         EndSelectedProcess(hwndOwner);
     else if (command == ID_CONTEXT_REMOVE_PROCESS)
         RemoveSelectedProcess();
