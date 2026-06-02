@@ -14,14 +14,14 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-echo Compiling ProcessWatcher.c as Windows GUI application...
+echo Compiling ProcessWatcher.c as a size-optimized Windows GUI application...
 windres ProcessWatcher.rc -O coff -o ProcessWatcher_res.o
 if %ERRORLEVEL% NEQ 0 (
     echo Resource compilation failed!
     exit /b 1
 )
 
-gcc -Wall -Wextra -o ProcessWatcher.exe ProcessWatcher.c ProcessWatcher_res.o -lkernel32 -luser32 -lgdi32 -lpsapi -lcomctl32 -mwindows
+gcc -Wall -Wextra -Os -s -o ProcessWatcher.exe ProcessWatcher.c ProcessWatcher_res.o -lkernel32 -luser32 -lgdi32 -lpsapi -lcomctl32 -mwindows
 
 if %ERRORLEVEL% EQU 0 (
     echo Compilation successful!
