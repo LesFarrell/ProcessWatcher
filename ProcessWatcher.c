@@ -21,7 +21,7 @@
 #define ID_CONTEXT_END_PROCESS 40002
 #define ID_CONTEXT_TOGGLE_TOPMOST 40003
 #define IDI_APP_ICON 101
-#define PROCESSES_FILE "WatchedProcesses.txt"
+#define SETTINGS_FILE_NAME "ProcessWatcher.ini"
 
 typedef struct
 {
@@ -46,6 +46,7 @@ typedef struct
     HWND hwndListView;
     HWND hwndAutoRefresh;
     BOOL bUpdatingComboText;
+    BOOL bProgrammaticComboDropdown;
     int sortColumn;
     BOOL sortAscending;
 } AppData;
@@ -58,6 +59,11 @@ typedef struct
 } ComboProcessEntry;
 
 AppData g_AppData = {0};
+
+BOOL IsWindowTopmost(HWND hwnd);
+void ToggleWatcherTopmost(HWND hwndOwner, BOOL makeTopmost);
+void SaveSettingsToIni(HWND hwndOwner);
+void LoadSettingsFromIni(HWND hwndOwner);
 
 BOOL IsAutoRefreshEnabled(void)
 {
@@ -115,6 +121,31 @@ void NormalizeWatchedProcessName(char *processName)
     }
 
     TrimProcessName(processName);
+}
+
+void GetSettingsFilePath(char *settingsPath, size_t settingsPathSize)
+{
+    char *lastSeparator;
+
+    if (!settingsPath || settingsPathSize == 0)
+        return;
+
+    if (GetModuleFileNameA(NULL, settingsPath, (DWORD)settingsPathSize) == 0)
+    {
+        strcpy_s(settingsPath, settingsPathSize, SETTINGS_FILE_NAME);
+        return;
+    }
+
+    lastSeparator = strrchr(settingsPath, '\\');
+    if (lastSeparator)
+    {
+        lastSeparator[1] = '\0';
+        strcat_s(settingsPath, settingsPathSize, SETTINGS_FILE_NAME);
+    }
+    else
+    {
+        strcpy_s(settingsPath, settingsPathSize, SETTINGS_FILE_NAME);
+    }
 }
 
 BOOL IsWatchedProcessName(const char *processName)
@@ -327,41 +358,56 @@ BOOL IsProcessRunning(const char *processName, DWORD *pPID, DWORD *pMemoryMB)
     return FALSE;
 }
 
-void SaveProcessesToFile()
+void SaveSettingsToIni(HWND hwndOwner)
 {
-    FILE *file = NULL;
-    fopen_s(&file, PROCESSES_FILE, "w");
+    char settingsPath[MAX_PATH] = {0};
+    char keyName[32];
+    char value[32];
 
-    if (file)
+    GetSettingsFilePath(settingsPath, sizeof(settingsPath));
+
+    WritePrivateProfileStringA("WatchedProcesses", NULL, NULL, settingsPath);
+    sprintf_s(value, sizeof(value), "%d", g_AppData.count);
+    WritePrivateProfileStringA("WatchedProcesses", "Count", value, settingsPath);
+
+    for (int i = 0; i < g_AppData.count; i++)
     {
-        for (int i = 0; i < g_AppData.count; i++)
-            fprintf(file, "%s\n", g_AppData.processes[i].name);
-
-        fclose(file);
+        sprintf_s(keyName, sizeof(keyName), "Item%d", i);
+        WritePrivateProfileStringA("WatchedProcesses", keyName, g_AppData.processes[i].name, settingsPath);
     }
+
+    sprintf_s(value, sizeof(value), "%d", IsWindowTopmost(hwndOwner) ? 1 : 0);
+    WritePrivateProfileStringA("Window", "KeepOnTop", value, settingsPath);
 }
 
-void LoadProcessesFromFile()
+void LoadSettingsFromIni(HWND hwndOwner)
 {
-    FILE *file = NULL;
-    fopen_s(&file, PROCESSES_FILE, "r");
+    char settingsPath[MAX_PATH] = {0};
+    UINT count;
 
-    if (file)
+    GetSettingsFilePath(settingsPath, sizeof(settingsPath));
+    g_AppData.count = 0;
+    count = GetPrivateProfileIntA("WatchedProcesses", "Count", 0, settingsPath);
+
+    for (UINT i = 0; i < count && g_AppData.count < MAX_PROCESSES; i++)
     {
-        char processName[256];
-        while (fgets(processName, sizeof(processName), file) && g_AppData.count < MAX_PROCESSES)
-        {
-            TrimProcessName(processName);
+        char keyName[32];
+        char processName[256] = {0};
 
-            if (strlen(processName) > 0 && !IsWatchedProcessName(processName))
-            {
-                strcpy_s(g_AppData.processes[g_AppData.count].name,
-                         sizeof(g_AppData.processes[0].name), processName);
-                g_AppData.count++;
-            }
+        sprintf_s(keyName, sizeof(keyName), "Item%u", i);
+        GetPrivateProfileStringA("WatchedProcesses", keyName, "",
+                                 processName, (DWORD)sizeof(processName), settingsPath);
+        TrimProcessName(processName);
+        if (strlen(processName) > 0 && !IsWatchedProcessName(processName))
+        {
+            strcpy_s(g_AppData.processes[g_AppData.count].name,
+                     sizeof(g_AppData.processes[0].name), processName);
+            g_AppData.count++;
         }
-        fclose(file);
     }
+
+    if (GetPrivateProfileIntA("Window", "KeepOnTop", 0, settingsPath) != 0)
+        ToggleWatcherTopmost(hwndOwner, TRUE);
 }
 
 int CompareInts(int left, int right)
@@ -584,7 +630,7 @@ void AddProcess(const char *processName)
              sizeof(g_AppData.processes[0].name), normalizedProcessName);
     g_AppData.count++;
 
-    SaveProcessesToFile();
+    SaveSettingsToIni(GetParent(g_AppData.hwndListView));
     RefreshProcessList(g_AppData.hwndListView);
 }
 
@@ -599,7 +645,7 @@ void RemoveProcess(int index)
     g_AppData.count--;
     ZeroMemory(&g_AppData.processes[g_AppData.count], sizeof(g_AppData.processes[g_AppData.count]));
 
-    SaveProcessesToFile();
+    SaveSettingsToIni(GetParent(g_AppData.hwndListView));
     RefreshProcessList(g_AppData.hwndListView);
 }
 
@@ -666,7 +712,10 @@ void ShowGlobalContextMenu(HWND hwndOwner, POINT screenPoint)
     DestroyMenu(hMenu);
 
     if (command == ID_CONTEXT_TOGGLE_TOPMOST)
+    {
         ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
+        SaveSettingsToIni(hwndOwner);
+    }
 }
 
 void EndSelectedProcess(HWND hwndOwner)
@@ -882,6 +931,21 @@ void PopulateComboBox(HWND hwndCombo)
     PopulateComboBoxFiltered(hwndCombo, NULL);
 }
 
+void RefreshComboBoxForCurrentText(HWND hwndCombo)
+{
+    char currentText[256] = {0};
+
+    if (!hwndCombo)
+        return;
+
+    GetWindowTextA(hwndCombo, currentText, sizeof(currentText));
+
+    if (currentText[0] != '\0')
+        PopulateComboBoxFiltered(hwndCombo, currentText);
+    else
+        PopulateComboBox(hwndCombo);
+}
+
 void ApplyComboBoxFilter(HWND hwndCombo)
 {
     char typedText[256] = {0};
@@ -905,8 +969,10 @@ void ApplyComboBoxFilter(HWND hwndCombo)
     SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(selectionStart, selectionEnd));
     g_AppData.bUpdatingComboText = FALSE;
 
+    g_AppData.bProgrammaticComboDropdown = TRUE;
     SendMessage(hwndCombo, CB_SHOWDROPDOWN,
                 (WPARAM)(typedText[0] != '\0' || wasDroppedDown), 0);
+    g_AppData.bProgrammaticComboDropdown = FALSE;
 }
 
 void LayoutControls(HWND hwnd)
@@ -986,7 +1052,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         g_AppData.sortColumn = 0;
         g_AppData.sortAscending = TRUE;
-        LoadProcessesFromFile();
+        LoadSettingsFromIni(hwnd);
 
         g_AppData.hwndProcessCombo = CreateWindow(TEXT("COMBOBOX"), TEXT(""),
                                                   WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
@@ -1094,8 +1160,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         else if (id == IDC_PROCESS_NAME && (notif == CBN_DROPDOWN || notif == CBN_KILLFOCUS))
         {
             HWND hwndCombo = GetDlgItem(hwnd, IDC_PROCESS_NAME);
+
+            if (notif == CBN_DROPDOWN && g_AppData.bProgrammaticComboDropdown)
+                return 0;
+
             KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
-            PopulateComboBox(hwndCombo);
+            RefreshComboBoxForCurrentText(hwndCombo);
         }
         else if (id == IDC_PROCESS_NAME && notif == CBN_EDITCHANGE)
         {
@@ -1221,7 +1291,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         KillTimer(hwnd, ID_REFRESH_TIMER);
         KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
-        SaveProcessesToFile();
+        SaveSettingsToIni(hwnd);
         PostQuitMessage(0);
         return 0;
     }
@@ -1271,7 +1341,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             CLASS_NAME,
             "ProcessWatcher",
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 640, 270,
+            CW_USEDEFAULT, CW_USEDEFAULT, 560, 270,
             NULL, NULL, hInstance, NULL);
 
         if (!hwnd)
