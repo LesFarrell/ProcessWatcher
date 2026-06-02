@@ -15,8 +15,11 @@
 #define IDC_AUTO_REFRESH 1006
 #define MAX_PROCESSES 100
 #define ID_REFRESH_TIMER 1
+#define ID_COMBO_FILTER_TIMER 2
+#define COMBO_FILTER_DELAY_MS 300
 #define ID_CONTEXT_REMOVE_PROCESS 40001
 #define ID_CONTEXT_END_PROCESS 40002
+#define ID_CONTEXT_TOGGLE_TOPMOST 40003
 #define IDI_APP_ICON 101
 #define PROCESSES_FILE "WatchedProcesses.txt"
 
@@ -615,6 +618,57 @@ void RemoveSelectedProcess(void)
         RemoveProcess(index);
 }
 
+BOOL IsWindowTopmost(HWND hwnd)
+{
+    return hwnd && (GetWindowLongPtr(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+void ToggleWatcherTopmost(HWND hwndOwner, BOOL makeTopmost)
+{
+    if (!hwndOwner)
+        return;
+
+    SetWindowPos(hwndOwner,
+                 makeTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE);
+}
+
+void ShowGlobalContextMenu(HWND hwndOwner, POINT screenPoint)
+{
+    HMENU hMenu;
+    BOOL watcherTopmost;
+    int command;
+
+    if (!hwndOwner)
+        return;
+
+    if (screenPoint.x == -1 && screenPoint.y == -1)
+    {
+        RECT windowRect;
+
+        if (!GetWindowRect(hwndOwner, &windowRect))
+            return;
+
+        screenPoint.x = windowRect.left + ((windowRect.right - windowRect.left) / 2);
+        screenPoint.y = windowRect.top + ((windowRect.bottom - windowRect.top) / 2);
+    }
+
+    watcherTopmost = IsWindowTopmost(hwndOwner);
+    hMenu = CreatePopupMenu();
+    if (!hMenu)
+        return;
+
+    AppendMenu(hMenu, MF_STRING | (watcherTopmost ? MF_CHECKED : MF_UNCHECKED), ID_CONTEXT_TOGGLE_TOPMOST,
+               watcherTopmost ? TEXT("Turn Off Keep On Top") : TEXT("Keep On Top"));
+    command = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
+                             0, hwndOwner, NULL);
+    DestroyMenu(hMenu);
+
+    if (command == ID_CONTEXT_TOGGLE_TOPMOST)
+        ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
+}
+
 void EndSelectedProcess(HWND hwndOwner)
 {
     int index = GetSelectedProcessIndex();
@@ -689,7 +743,7 @@ BOOL TrySelectListViewItemAtScreenPoint(HWND hwndListView, POINT screenPoint, in
     return TRUE;
 }
 
-void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoint)
+BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoint)
 {
     int index = -1;
     HMENU hMenu;
@@ -698,7 +752,7 @@ void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     int command;
 
     if (!hwndListView)
-        return;
+        return FALSE;
 
     if (screenPoint.x == -1 && screenPoint.y == -1)
     {
@@ -706,7 +760,7 @@ void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
 
         index = GetSelectedProcessIndex();
         if (index == -1 || !ListView_GetItemRect(hwndListView, index, &itemRect, LVIR_BOUNDS))
-            return;
+            return FALSE;
 
         screenPoint.x = itemRect.left;
         screenPoint.y = itemRect.bottom;
@@ -714,11 +768,11 @@ void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     }
     else if (!TrySelectListViewItemAtScreenPoint(hwndListView, screenPoint, &index))
     {
-        return;
+        return FALSE;
     }
 
     if (index == -1)
-        return;
+        return FALSE;
 
     if (IsAutoRefreshEnabled())
         removeFlags |= MF_GRAYED;
@@ -727,7 +781,7 @@ void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
 
     hMenu = CreatePopupMenu();
     if (!hMenu)
-        return;
+        return FALSE;
 
     AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -740,6 +794,8 @@ void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
         EndSelectedProcess(hwndOwner);
     else if (command == ID_CONTEXT_REMOVE_PROCESS)
         RemoveSelectedProcess();
+
+    return TRUE;
 }
 
 void PopulateComboBoxFiltered(HWND hwndCombo, const char *filterText)
@@ -824,6 +880,33 @@ void PopulateComboBoxFiltered(HWND hwndCombo, const char *filterText)
 void PopulateComboBox(HWND hwndCombo)
 {
     PopulateComboBoxFiltered(hwndCombo, NULL);
+}
+
+void ApplyComboBoxFilter(HWND hwndCombo)
+{
+    char typedText[256] = {0};
+    DWORD editSelection;
+    int selectionStart;
+    int selectionEnd;
+    BOOL wasDroppedDown;
+
+    if (!hwndCombo || g_AppData.bUpdatingComboText)
+        return;
+
+    GetWindowTextA(hwndCombo, typedText, sizeof(typedText));
+    editSelection = (DWORD)SendMessage(hwndCombo, CB_GETEDITSEL, 0, 0);
+    selectionStart = LOWORD(editSelection);
+    selectionEnd = HIWORD(editSelection);
+    wasDroppedDown = (BOOL)SendMessage(hwndCombo, CB_GETDROPPEDSTATE, 0, 0);
+
+    g_AppData.bUpdatingComboText = TRUE;
+    PopulateComboBoxFiltered(hwndCombo, typedText);
+    SetWindowTextA(hwndCombo, typedText);
+    SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(selectionStart, selectionEnd));
+    g_AppData.bUpdatingComboText = FALSE;
+
+    SendMessage(hwndCombo, CB_SHOWDROPDOWN,
+                (WPARAM)(typedText[0] != '\0' || wasDroppedDown), 0);
 }
 
 void LayoutControls(HWND hwnd)
@@ -1003,6 +1086,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (strlen(processName) > 0)
             {
                 AddProcess(processName);
+                KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
                 SetWindowTextA(hwndCombo, "");
                 SetFocus(hwndCombo);
             }
@@ -1010,35 +1094,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         else if (id == IDC_PROCESS_NAME && (notif == CBN_DROPDOWN || notif == CBN_KILLFOCUS))
         {
             HWND hwndCombo = GetDlgItem(hwnd, IDC_PROCESS_NAME);
+            KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
             PopulateComboBox(hwndCombo);
         }
         else if (id == IDC_PROCESS_NAME && notif == CBN_EDITCHANGE)
         {
-            HWND hwndCombo = GetDlgItem(hwnd, IDC_PROCESS_NAME);
-
             if (!g_AppData.bUpdatingComboText)
-            {
-                char typedText[256] = {0};
-                DWORD editSelection;
-                int selectionStart;
-                int selectionEnd;
-                BOOL wasDroppedDown;
-
-                GetWindowTextA(hwndCombo, typedText, sizeof(typedText));
-                editSelection = (DWORD)SendMessage(hwndCombo, CB_GETEDITSEL, 0, 0);
-                selectionStart = LOWORD(editSelection);
-                selectionEnd = HIWORD(editSelection);
-                wasDroppedDown = (BOOL)SendMessage(hwndCombo, CB_GETDROPPEDSTATE, 0, 0);
-
-                g_AppData.bUpdatingComboText = TRUE;
-                PopulateComboBoxFiltered(hwndCombo, typedText);
-                SetWindowTextA(hwndCombo, typedText);
-                SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(selectionStart, selectionEnd));
-                g_AppData.bUpdatingComboText = FALSE;
-
-                SendMessage(hwndCombo, CB_SHOWDROPDOWN,
-                            (WPARAM)(typedText[0] != '\0' || wasDroppedDown), 0);
-            }
+                SetTimer(hwnd, ID_COMBO_FILTER_TIMER, COMBO_FILTER_DELAY_MS, NULL);
         }
         else if (id == IDC_REMOVE_BUTTON)
         {
@@ -1066,6 +1128,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         if (wParam == ID_REFRESH_TIMER)
             RefreshProcessList(g_AppData.hwndListView);
+        else if (wParam == ID_COMBO_FILTER_TIMER)
+        {
+            KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
+            ApplyComboBoxFilter(g_AppData.hwndProcessCombo);
+        }
         return 0;
     }
 
@@ -1117,15 +1184,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_CONTEXTMENU:
     {
+        POINT screenPoint;
+        screenPoint.x = GET_X_LPARAM(lParam);
+        screenPoint.y = GET_Y_LPARAM(lParam);
+
         if ((HWND)wParam == g_AppData.hwndListView)
         {
-            POINT screenPoint;
-            screenPoint.x = GET_X_LPARAM(lParam);
-            screenPoint.y = GET_Y_LPARAM(lParam);
-            ShowListViewContextMenu(hwnd, g_AppData.hwndListView, screenPoint);
-            return 0;
+            if (ShowListViewContextMenu(hwnd, g_AppData.hwndListView, screenPoint))
+                return 0;
         }
-        break;
+
+        ShowGlobalContextMenu(hwnd, screenPoint);
+        return 0;
     }
 
     case WM_SIZE:
@@ -1150,6 +1220,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_DESTROY:
     {
         KillTimer(hwnd, ID_REFRESH_TIMER);
+        KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
         SaveProcessesToFile();
         PostQuitMessage(0);
         return 0;
