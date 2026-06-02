@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <windowsx.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <commctrl.h>
@@ -14,6 +15,8 @@
 #define IDC_AUTO_REFRESH 1006
 #define MAX_PROCESSES 100
 #define ID_REFRESH_TIMER 1
+#define ID_CONTEXT_REMOVE_PROCESS 40001
+#define ID_CONTEXT_END_PROCESS 40002
 #define IDI_APP_ICON 101
 #define PROCESSES_FILE "WatchedProcesses.txt"
 
@@ -44,12 +47,30 @@ typedef struct
     BOOL sortAscending;
 } AppData;
 
+typedef struct
+{
+    char name[256];
+    DWORD pid;
+    int matchRank;
+} ComboProcessEntry;
+
 AppData g_AppData = {0};
 
 BOOL IsAutoRefreshEnabled(void)
 {
     return g_AppData.hwndAutoRefresh &&
            SendMessage(g_AppData.hwndAutoRefresh, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void UpdateManualRefreshControls(void)
+{
+    BOOL enableManualControls = !IsAutoRefreshEnabled();
+
+    if (g_AppData.hwndRemoveButton)
+        EnableWindow(g_AppData.hwndRemoveButton, enableManualControls);
+
+    if (g_AppData.hwndRefreshButton)
+        EnableWindow(g_AppData.hwndRefreshButton, enableManualControls);
 }
 
 ULONGLONG FileTimeToUInt64(FILETIME fileTime)
@@ -93,23 +114,6 @@ void NormalizeWatchedProcessName(char *processName)
     TrimProcessName(processName);
 }
 
-void ExtractProcessNameFromDisplayText(const char *displayText, char *processName, size_t processNameSize)
-{
-    const char *suffix = strrchr(displayText, '(');
-
-    if (strcpy_s(processName, processNameSize, displayText) != 0)
-        return;
-
-    if (suffix != NULL && suffix > displayText && suffix[-1] == ' ')
-    {
-        size_t nameLength = (size_t)(suffix - displayText - 1);
-        if (nameLength < processNameSize)
-            processName[nameLength] = '\0';
-    }
-
-    TrimProcessName(processName);
-}
-
 BOOL IsWatchedProcessName(const char *processName)
 {
     for (int i = 0; i < g_AppData.count; i++)
@@ -119,6 +123,73 @@ BOOL IsWatchedProcessName(const char *processName)
     }
 
     return FALSE;
+}
+
+BOOL ContainsTextInsensitive(const char *text, const char *pattern)
+{
+    size_t patternLength;
+
+    if (!text || !pattern)
+        return FALSE;
+
+    patternLength = strlen(pattern);
+    if (patternLength == 0)
+        return TRUE;
+
+    for (; *text != '\0'; text++)
+    {
+        if (_strnicmp(text, pattern, patternLength) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+int GetComboMatchRank(const char *processName, const char *filterText)
+{
+    size_t filterLength;
+
+    if (!filterText)
+        return 0;
+
+    filterLength = strlen(filterText);
+    if (filterLength == 0)
+        return 0;
+
+    if (_stricmp(processName, filterText) == 0)
+        return 0;
+
+    if (_strnicmp(processName, filterText, filterLength) == 0)
+        return 1;
+
+    if (ContainsTextInsensitive(processName, filterText))
+        return 2;
+
+    return -1;
+}
+
+int CompareComboProcessEntries(const void *left, const void *right)
+{
+    const ComboProcessEntry *entryLeft = (const ComboProcessEntry *)left;
+    const ComboProcessEntry *entryRight = (const ComboProcessEntry *)right;
+    int result = 0;
+
+    if (entryLeft->matchRank < entryRight->matchRank)
+        result = -1;
+    else if (entryLeft->matchRank > entryRight->matchRank)
+        result = 1;
+
+    if (result == 0)
+        result = _stricmp(entryLeft->name, entryRight->name);
+    if (result == 0)
+    {
+        if (entryLeft->pid < entryRight->pid)
+            result = -1;
+        else if (entryLeft->pid > entryRight->pid)
+            result = 1;
+    }
+
+    return result;
 }
 
 DWORD GetProcessMemoryMB(DWORD pid)
@@ -367,10 +438,46 @@ void SortWatchedProcesses(void)
     }
 }
 
+BOOL GetSelectedProcessName(char *processName, size_t processNameSize)
+{
+    int index;
+
+    if (!processName || processNameSize == 0 || !g_AppData.hwndListView)
+        return FALSE;
+
+    index = (int)SendMessage(g_AppData.hwndListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    if (index == -1 || index >= g_AppData.count)
+        return FALSE;
+
+    return strcpy_s(processName, processNameSize, g_AppData.processes[index].name) == 0;
+}
+
+void RestoreSelectedProcess(HWND hwndListView, const char *processName)
+{
+    if (!hwndListView || !processName || processName[0] == '\0')
+        return;
+
+    for (int i = 0; i < g_AppData.count; i++)
+    {
+        if (_stricmp(g_AppData.processes[i].name, processName) == 0)
+        {
+            ListView_SetItemState(hwndListView, i, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetSelectionMark(hwndListView, i);
+            ListView_EnsureVisible(hwndListView, i, FALSE);
+            break;
+        }
+    }
+}
+
 void RefreshProcessList(HWND hwndListView)
 {
+    char selectedProcessName[256] = {0};
+
     if (!hwndListView)
         return;
+
+    GetSelectedProcessName(selectedProcessName, sizeof(selectedProcessName));
 
     SendMessage(hwndListView, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(hwndListView);
@@ -440,6 +547,8 @@ void RefreshProcessList(HWND hwndListView)
         }
     }
 
+    RestoreSelectedProcess(hwndListView, selectedProcessName);
+
     SendMessage(hwndListView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hwndListView, NULL, TRUE);
     UpdateWindow(hwndListView);
@@ -491,14 +600,156 @@ void RemoveProcess(int index)
     RefreshProcessList(g_AppData.hwndListView);
 }
 
+int GetSelectedProcessIndex(void)
+{
+    if (!g_AppData.hwndListView)
+        return -1;
+
+    return (int)SendMessage(g_AppData.hwndListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+}
+
+void RemoveSelectedProcess(void)
+{
+    int index = GetSelectedProcessIndex();
+    if (index != -1)
+        RemoveProcess(index);
+}
+
+void EndSelectedProcess(HWND hwndOwner)
+{
+    int index = GetSelectedProcessIndex();
+    HANDLE hProcess;
+    char message[512];
+    DWORD errorCode;
+
+    if (index == -1 || index >= g_AppData.count)
+        return;
+
+    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
+    {
+        MessageBox(hwndOwner, "The selected process is not currently running.",
+                   "End Process", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    sprintf_s(message, sizeof(message), "End process \"%s\" (PID %lu)?",
+              g_AppData.processes[index].name, g_AppData.processes[index].pid);
+    if (MessageBox(hwndOwner, message, "Confirm End Process",
+                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    {
+        return;
+    }
+
+    hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, g_AppData.processes[index].pid);
+    if (!hProcess)
+    {
+        errorCode = GetLastError();
+        sprintf_s(message, sizeof(message),
+                  "Unable to open PID %lu for termination.\nWindows error: %lu",
+                  g_AppData.processes[index].pid, errorCode);
+        MessageBox(hwndOwner, message, "End Process Failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (!TerminateProcess(hProcess, 1))
+    {
+        errorCode = GetLastError();
+        CloseHandle(hProcess);
+        sprintf_s(message, sizeof(message),
+                  "Failed to end \"%s\" (PID %lu).\nWindows error: %lu",
+                  g_AppData.processes[index].name, g_AppData.processes[index].pid, errorCode);
+        MessageBox(hwndOwner, message, "End Process Failed", MB_OK | MB_ICONERROR);
+        RefreshProcessList(g_AppData.hwndListView);
+        return;
+    }
+
+    CloseHandle(hProcess);
+    RefreshProcessList(g_AppData.hwndListView);
+}
+
+BOOL TrySelectListViewItemAtScreenPoint(HWND hwndListView, POINT screenPoint, int *pIndex)
+{
+    LVHITTESTINFO hitTest = {0};
+
+    hitTest.pt = screenPoint;
+    ScreenToClient(hwndListView, &hitTest.pt);
+
+    hitTest.iItem = ListView_SubItemHitTest(hwndListView, &hitTest);
+    if (hitTest.iItem == -1 || (hitTest.flags & LVHT_ONITEM) == 0)
+        return FALSE;
+
+    ListView_SetItemState(hwndListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(hwndListView, hitTest.iItem, LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(hwndListView, hitTest.iItem, FALSE);
+
+    if (pIndex)
+        *pIndex = hitTest.iItem;
+
+    return TRUE;
+}
+
+void ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoint)
+{
+    int index = -1;
+    HMENU hMenu;
+    UINT removeFlags = MF_STRING;
+    UINT endProcessFlags = MF_STRING;
+    int command;
+
+    if (!hwndListView)
+        return;
+
+    if (screenPoint.x == -1 && screenPoint.y == -1)
+    {
+        RECT itemRect;
+
+        index = GetSelectedProcessIndex();
+        if (index == -1 || !ListView_GetItemRect(hwndListView, index, &itemRect, LVIR_BOUNDS))
+            return;
+
+        screenPoint.x = itemRect.left;
+        screenPoint.y = itemRect.bottom;
+        ClientToScreen(hwndListView, &screenPoint);
+    }
+    else if (!TrySelectListViewItemAtScreenPoint(hwndListView, screenPoint, &index))
+    {
+        return;
+    }
+
+    if (index == -1)
+        return;
+
+    if (IsAutoRefreshEnabled())
+        removeFlags |= MF_GRAYED;
+    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
+        endProcessFlags |= MF_GRAYED;
+
+    hMenu = CreatePopupMenu();
+    if (!hMenu)
+        return;
+
+    AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, removeFlags, ID_CONTEXT_REMOVE_PROCESS, TEXT("Remove Selected"));
+    command = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
+                             0, hwndOwner, NULL);
+    DestroyMenu(hMenu);
+
+    if (command == ID_CONTEXT_END_PROCESS)
+        EndSelectedProcess(hwndOwner);
+    else if (command == ID_CONTEXT_REMOVE_PROCESS)
+        RemoveSelectedProcess();
+}
+
 void PopulateComboBoxFiltered(HWND hwndCombo, const char *filterText)
 {
     char currentText[256] = {0};
-    size_t filterLength = 0;
+    ComboProcessEntry *entries = NULL;
+    int entryCount = 0;
+    int entryCapacity = 0;
 
     GetWindowTextA(hwndCombo, currentText, sizeof(currentText));
-    if (filterText != NULL)
-        filterLength = strlen(filterText);
 
     SendMessage(hwndCombo, CB_RESETCONTENT, 0, 0);
 
@@ -514,28 +765,58 @@ void PopulateComboBoxFiltered(HWND hwndCombo, const char *filterText)
                 do
                 {
                     char processName[256];
-                    char displayText[320];
+                    int matchRank;
 
                     if (!GetProcessExecutableNameByPid(pe32.th32ProcessID, processName, sizeof(processName)))
                         strcpy_s(processName, sizeof(processName), pe32.szExeFile);
 
-                    if (filterLength > 0 && _strnicmp(processName, filterText, filterLength) != 0)
+                    if (IsWatchedProcessName(processName))
                         continue;
 
-                    sprintf_s(displayText, sizeof(displayText), "%s (%lu)",
-                              processName, pe32.th32ProcessID);
+                    matchRank = GetComboMatchRank(processName, filterText);
+                    if (matchRank < 0)
+                        continue;
 
+                    if (entryCount == entryCapacity)
                     {
-                        LRESULT index = SendMessage(hwndCombo, CB_ADDSTRING, 0, (LPARAM)displayText);
-                        if (index != CB_ERR && index != CB_ERRSPACE)
-                            SendMessage(hwndCombo, CB_SETITEMDATA, (WPARAM)index, (LPARAM)pe32.th32ProcessID);
+                        int newCapacity = entryCapacity == 0 ? 64 : entryCapacity * 2;
+                        ComboProcessEntry *newEntries = (ComboProcessEntry *)realloc(entries, sizeof(ComboProcessEntry) * (size_t)newCapacity);
+
+                        if (!newEntries)
+                            break;
+
+                        entries = newEntries;
+                        entryCapacity = newCapacity;
                     }
+
+                    strcpy_s(entries[entryCount].name, sizeof(entries[entryCount].name), processName);
+                    entries[entryCount].pid = pe32.th32ProcessID;
+                    entries[entryCount].matchRank = matchRank;
+                    entryCount++;
                 } while (Process32Next(hSnapshot, &pe32));
             }
 
             CloseHandle(hSnapshot);
         }
     }
+
+    if (entries && entryCount > 1)
+        qsort(entries, (size_t)entryCount, sizeof(entries[0]), CompareComboProcessEntries);
+
+    for (int i = 0; i < entryCount; i++)
+    {
+        char displayText[320];
+        LRESULT index;
+
+        sprintf_s(displayText, sizeof(displayText), "%s (%lu)",
+                  entries[i].name, entries[i].pid);
+
+        index = SendMessage(hwndCombo, CB_ADDSTRING, 0, (LPARAM)displayText);
+        if (index != CB_ERR && index != CB_ERRSPACE)
+            SendMessage(hwndCombo, CB_SETITEMDATA, (WPARAM)index, (LPARAM)entries[i].pid);
+    }
+
+    free(entries);
 
     SetWindowTextA(hwndCombo, currentText);
 }
@@ -598,6 +879,20 @@ void LayoutControls(HWND hwnd)
             MoveWindow(g_AppData.hwndRefreshButton, clientWidth - margin - refreshWidth,
                        buttonY, refreshWidth, rowHeight, TRUE);
     }
+}
+
+void GetMinimumWindowSize(HWND hwnd, int *minWidth, int *minHeight)
+{
+    RECT minClientRect = {0, 0, 525, 170};
+    DWORD style = (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE);
+    DWORD exStyle = (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+
+    AdjustWindowRectEx(&minClientRect, style, FALSE, exStyle);
+
+    if (minWidth)
+        *minWidth = minClientRect.right - minClientRect.left;
+    if (minHeight)
+        *minHeight = minClientRect.bottom - minClientRect.top;
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -674,6 +969,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
 
         LayoutControls(hwnd);
+        UpdateManualRefreshControls();
         RefreshProcessList(g_AppData.hwndListView);
         SetTimer(hwnd, ID_REFRESH_TIMER, 1000, NULL);
         return 0;
@@ -723,51 +1019,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (!g_AppData.bUpdatingComboText)
             {
                 char typedText[256] = {0};
-                int typedLength;
+                DWORD editSelection;
+                int selectionStart;
+                int selectionEnd;
+                BOOL wasDroppedDown;
 
                 GetWindowTextA(hwndCombo, typedText, sizeof(typedText));
-                typedLength = (int)strlen(typedText);
+                editSelection = (DWORD)SendMessage(hwndCombo, CB_GETEDITSEL, 0, 0);
+                selectionStart = LOWORD(editSelection);
+                selectionEnd = HIWORD(editSelection);
+                wasDroppedDown = (BOOL)SendMessage(hwndCombo, CB_GETDROPPEDSTATE, 0, 0);
 
                 g_AppData.bUpdatingComboText = TRUE;
                 PopulateComboBoxFiltered(hwndCombo, typedText);
+                SetWindowTextA(hwndCombo, typedText);
+                SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(selectionStart, selectionEnd));
                 g_AppData.bUpdatingComboText = FALSE;
 
-                if (typedLength > 0)
-                {
-                    int itemCount = (int)SendMessage(hwndCombo, CB_GETCOUNT, 0, 0);
-
-                    for (int i = 0; i < itemCount; i++)
-                    {
-                        char matchedDisplayText[320] = {0};
-                        char matchedProcessName[256] = {0};
-                        SendMessage(hwndCombo, CB_GETLBTEXT, (WPARAM)i, (LPARAM)matchedDisplayText);
-                        ExtractProcessNameFromDisplayText(matchedDisplayText,
-                                                          matchedProcessName, sizeof(matchedProcessName));
-
-                        if (_strnicmp(matchedProcessName, typedText, typedLength) == 0)
-                        {
-                            g_AppData.bUpdatingComboText = TRUE;
-                            SetWindowTextA(hwndCombo, matchedProcessName);
-                            SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(typedLength, -1));
-                            SendMessage(hwndCombo, CB_SETCURSEL, (WPARAM)i, 0);
-                            SendMessage(hwndCombo, CB_SETTOPINDEX, (WPARAM)i, 0);
-                            SendMessage(hwndCombo, CB_SHOWDROPDOWN, TRUE, 0);
-                            g_AppData.bUpdatingComboText = FALSE;
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    SendMessage(hwndCombo, CB_SHOWDROPDOWN, FALSE, 0);
-                }
+                SendMessage(hwndCombo, CB_SHOWDROPDOWN,
+                            (WPARAM)(typedText[0] != '\0' || wasDroppedDown), 0);
             }
         }
         else if (id == IDC_REMOVE_BUTTON)
         {
-            int index = (int)SendMessage(g_AppData.hwndListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-            if (index != -1)
-                RemoveProcess(index);
+            RemoveSelectedProcess();
         }
         else if (id == IDC_REFRESH_BUTTON)
         {
@@ -780,6 +1055,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             else
                 KillTimer(hwnd, ID_REFRESH_TIMER);
 
+            UpdateManualRefreshControls();
             InvalidateRect(g_AppData.hwndListView, NULL, TRUE);
             UpdateWindow(g_AppData.hwndListView);
         }
@@ -839,10 +1115,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         break;
     }
 
+    case WM_CONTEXTMENU:
+    {
+        if ((HWND)wParam == g_AppData.hwndListView)
+        {
+            POINT screenPoint;
+            screenPoint.x = GET_X_LPARAM(lParam);
+            screenPoint.y = GET_Y_LPARAM(lParam);
+            ShowListViewContextMenu(hwnd, g_AppData.hwndListView, screenPoint);
+            return 0;
+        }
+        break;
+    }
+
     case WM_SIZE:
     {
         (void)lParam;
         LayoutControls(hwnd);
+        return 0;
+    }
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *minMaxInfo = (MINMAXINFO *)lParam;
+        int minWidth = 0;
+        int minHeight = 0;
+
+        GetMinimumWindowSize(hwnd, &minWidth, &minHeight);
+        minMaxInfo->ptMinTrackSize.x = minWidth;
+        minMaxInfo->ptMinTrackSize.y = minHeight;
         return 0;
     }
 
@@ -899,7 +1200,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             CLASS_NAME,
             "ProcessWatcher",
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 640, 370,
+            CW_USEDEFAULT, CW_USEDEFAULT, 640, 270,
             NULL, NULL, hInstance, NULL);
 
         if (!hwnd)
