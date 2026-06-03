@@ -26,6 +26,8 @@
 #define ID_OPTIONS_AUTO_REFRESH 40006
 #define ID_OPTIONS_START_WITH_WINDOWS 40007
 #define ID_OPTIONS_FLASH_ON_STOP 40008
+#define ID_FORCE_REFRESH 40009
+#define ID_FILE_EXIT 40010
 #define IDI_APP_ICON 101
 #define SETTINGS_FILE_NAME "ProcessWatcher.ini"
 #define RUN_REGISTRY_PATH "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
@@ -812,24 +814,36 @@ void ApplyAutoRefreshTimer(HWND hwnd)
 HMENU CreateMainWindowMenu(void)
 {
     HMENU hMenuBar = CreateMenu();
+    HMENU hFileMenu;
     HMENU hOptionsMenu;
 
     if (!hMenuBar)
         return NULL;
 
-    hOptionsMenu = CreatePopupMenu();
-    if (!hOptionsMenu)
+    hFileMenu = CreatePopupMenu();
+    if (!hFileMenu)
     {
         DestroyMenu(hMenuBar);
         return NULL;
     }
 
+    hOptionsMenu = CreatePopupMenu();
+    if (!hOptionsMenu)
+    {
+        DestroyMenu(hFileMenu);
+        DestroyMenu(hMenuBar);
+        return NULL;
+    }
+
+    AppendMenu(hFileMenu, MF_STRING, ID_FILE_EXIT, TEXT("Exit"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_START_WITH_WINDOWS, TEXT("Start with Windows"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_FLASH_ON_STOP, TEXT("Flash on Stop"));
 
-    if (!AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hOptionsMenu, TEXT("Options")))
+    if (!AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, TEXT("File")) ||
+        !AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hOptionsMenu, TEXT("Options")))
     {
+        DestroyMenu(hFileMenu);
         DestroyMenu(hOptionsMenu);
         DestroyMenu(hMenuBar);
         return NULL;
@@ -1671,6 +1685,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         {
             RemoveSelectedProcess();
         }
+        else if (id == ID_FILE_EXIT)
+        {
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+        }
+        else if (id == ID_FORCE_REFRESH)
+        {
+            RefreshProcessList(g_AppData.hwndListView);
+        }
         else if (id == ID_OPTIONS_AUTO_REFRESH)
         {
             g_AppData.autoRefreshEnabled = !g_AppData.autoRefreshEnabled;
@@ -1817,6 +1839,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     INITCOMMONCONTROLSEX icex = {0};
     HICON hLargeIcon;
     HICON hSmallIcon;
+    HWND hwnd;
+    HACCEL hAccel = NULL;
     (void)hPrevInstance;
     (void)lpCmdLine;
 
@@ -1843,35 +1867,47 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         RegisterClassEx(&wc);
     }
 
+    hwnd = CreateWindowEx(
+        0,
+        CLASS_NAME,
+        "ProcessWatcher",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 340,
+        NULL, NULL, hInstance, NULL);
+
+    if (!hwnd)
     {
-        HWND hwnd = CreateWindowEx(
-            0,
-            CLASS_NAME,
-            "ProcessWatcher",
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 760, 340,
-            NULL, NULL, hInstance, NULL);
-
-        if (!hwnd)
-        {
-            MessageBox(NULL, "Window creation failed!", "Error", MB_OK | MB_ICONERROR);
-            return 1;
-        }
-
-        SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hLargeIcon);
-        SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hSmallIcon);
-
-        ShowWindow(hwnd, nCmdShow);
-        UpdateWindow(hwnd);
+        MessageBox(NULL, "Window creation failed!", "Error", MB_OK | MB_ICONERROR);
+        return 1;
     }
+
+    SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hLargeIcon);
+    SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hSmallIcon);
+
+    {
+        ACCEL refreshAccel = {0};
+        refreshAccel.fVirt = FVIRTKEY;
+        refreshAccel.key = VK_F5;
+        refreshAccel.cmd = ID_FORCE_REFRESH;
+        hAccel = CreateAcceleratorTable(&refreshAccel, 1);
+    }
+
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
 
     {
         MSG msg = {0};
         while (GetMessage(&msg, NULL, 0, 0))
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            if (!hAccel || !TranslateAccelerator(hwnd, hAccel, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
         }
+
+        if (hAccel)
+            DestroyAcceleratorTable(hAccel);
 
         return (int)msg.wParam;
     }
