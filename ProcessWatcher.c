@@ -11,10 +11,10 @@
 #define IDC_PROCESS_NAME 1001
 #define IDC_ADD_BUTTON 1002
 #define IDC_REMOVE_BUTTON 1003
-#define IDC_REFRESH_BUTTON 1004
-#define IDC_LISTBOX 1005
-#define IDC_AUTO_REFRESH 1006
+#define IDC_LISTBOX 1004
+#define IDC_STATUS_BAR 1005
 #define MAX_PROCESSES 100
+#define COLUMN_COUNT 6
 #define ID_REFRESH_TIMER 1
 #define ID_COMBO_FILTER_TIMER 2
 #define COMBO_FILTER_DELAY_MS 300
@@ -22,8 +22,15 @@
 #define ID_CONTEXT_END_PROCESS 40002
 #define ID_CONTEXT_TOGGLE_TOPMOST 40003
 #define ID_CONTEXT_OPEN_TASK_MANAGER 40004
+#define ID_CONTEXT_OPEN_FILE_LOCATION 40005
+#define ID_OPTIONS_AUTO_REFRESH 40006
+#define ID_OPTIONS_START_WITH_WINDOWS 40007
+#define ID_OPTIONS_FLASH_ON_STOP 40008
 #define IDI_APP_ICON 101
 #define SETTINGS_FILE_NAME "ProcessWatcher.ini"
+#define RUN_REGISTRY_PATH "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_REGISTRY_VALUE "ProcessWatcher"
+#define DEFAULT_REFRESH_INTERVAL_MS 1000
 
 typedef struct
 {
@@ -35,6 +42,8 @@ typedef struct
     ULONGLONG lastCpuTime;
     ULONGLONG lastSampleTime;
     DWORD lastSamplePid;
+    SYSTEMTIME lastSeenLocalTime;
+    BOOL hasLastSeen;
 } WatchedProcess;
 
 typedef struct
@@ -44,13 +53,17 @@ typedef struct
     HWND hwndProcessCombo;
     HWND hwndAddButton;
     HWND hwndRemoveButton;
-    HWND hwndRefreshButton;
     HWND hwndListView;
-    HWND hwndAutoRefresh;
+    HWND hwndStatusBar;
     BOOL bUpdatingComboText;
-    BOOL bProgrammaticComboDropdown;
+    BOOL autoRefreshEnabled;
+    BOOL startWithWindows;
+    BOOL flashOnStop;
     int sortColumn;
     BOOL sortAscending;
+    RECT savedWindowRect;
+    BOOL hasSavedWindowRect;
+    int savedColumnWidths[COLUMN_COUNT];
 } AppData;
 
 typedef struct
@@ -62,26 +75,42 @@ typedef struct
 
 AppData g_AppData = {0};
 
+LRESULT CALLBACK ComboOpenOnClickProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 BOOL IsWindowTopmost(HWND hwnd);
 void ToggleWatcherTopmost(HWND hwndOwner, BOOL makeTopmost);
-void SaveSettingsToIni(HWND hwndOwner);
+BOOL SaveSettingsToIni(HWND hwndOwner);
 void LoadSettingsFromIni(HWND hwndOwner);
+void ShowSettingsSaveError(HWND hwndOwner);
+void SaveSettingsWithFeedback(HWND hwndOwner);
+BOOL GetProcessExecutablePathByPid(DWORD pid, char *processPath, size_t processPathSize);
+void UpdateStatusBar(void);
+void ApplyAutoRefreshTimer(HWND hwnd);
+BOOL SetStartWithWindowsEnabled(BOOL enabled);
+void ApplySavedWindowPlacement(HWND hwnd);
+void FlashWatcherWindow(HWND hwnd);
+HMENU CreateMainWindowMenu(void);
+void UpdateOptionsMenuState(HWND hwnd);
 
 BOOL IsAutoRefreshEnabled(void)
 {
-    return g_AppData.hwndAutoRefresh &&
-           SendMessage(g_AppData.hwndAutoRefresh, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    return g_AppData.autoRefreshEnabled;
 }
 
-void UpdateManualRefreshControls(void)
+LRESULT CALLBACK ComboOpenOnClickProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    BOOL enableManualControls = !IsAutoRefreshEnabled();
+    (void)uIdSubclass;
+    (void)dwRefData;
 
-    if (g_AppData.hwndRemoveButton)
-        EnableWindow(g_AppData.hwndRemoveButton, enableManualControls);
+    if ((uMsg == WM_LBUTTONUP || uMsg == WM_LBUTTONDBLCLK) &&
+        g_AppData.hwndProcessCombo &&
+        SendMessage(g_AppData.hwndProcessCombo, CB_GETDROPPEDSTATE, 0, 0) == 0)
+    {
+        PostMessage(g_AppData.hwndProcessCombo, CB_SHOWDROPDOWN, TRUE, 0);
+    }
 
-    if (g_AppData.hwndRefreshButton)
-        EnableWindow(g_AppData.hwndRefreshButton, enableManualControls);
+    return DefSubclassProc(hwnd, uMsg, wParam, lParam);
 }
 
 ULONGLONG FileTimeToUInt64(FILETIME fileTime)
@@ -90,6 +119,16 @@ ULONGLONG FileTimeToUInt64(FILETIME fileTime)
     value.LowPart = fileTime.dwLowDateTime;
     value.HighPart = fileTime.dwHighDateTime;
     return value.QuadPart;
+}
+
+ULONGLONG SystemTimeToUInt64(SYSTEMTIME systemTime)
+{
+    FILETIME fileTime;
+
+    if (!SystemTimeToFileTime(&systemTime, &fileTime))
+        return 0;
+
+    return FileTimeToUInt64(fileTime);
 }
 
 void TrimProcessName(char *processName)
@@ -148,6 +187,51 @@ void GetSettingsFilePath(char *settingsPath, size_t settingsPathSize)
     {
         strcpy_s(settingsPath, settingsPathSize, SETTINGS_FILE_NAME);
     }
+}
+
+BOOL GetTempSettingsFilePath(char *tempPath, size_t tempPathSize)
+{
+    char settingsPath[MAX_PATH] = {0};
+    char *extension;
+
+    if (!tempPath || tempPathSize == 0)
+        return FALSE;
+
+    GetSettingsFilePath(settingsPath, sizeof(settingsPath));
+    if (strcpy_s(tempPath, tempPathSize, settingsPath) != 0)
+        return FALSE;
+
+    extension = strrchr(tempPath, '.');
+    if (extension)
+        return strcpy_s(extension, tempPathSize - (size_t)(extension - tempPath), ".tmp") == 0;
+
+    return strcat_s(tempPath, tempPathSize, ".tmp") == 0;
+}
+
+BOOL GetProcessExecutablePathByPid(DWORD pid, char *processPath, size_t processPathSize)
+{
+    DWORD pathSize;
+    HANDLE hProcess;
+
+    if (!processPath || processPathSize == 0)
+        return FALSE;
+
+    processPath[0] = '\0';
+    pathSize = (DWORD)processPathSize;
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+
+    if (!hProcess)
+        return FALSE;
+
+    if (!QueryFullProcessImageNameA(hProcess, 0, processPath, &pathSize))
+    {
+        CloseHandle(hProcess);
+        processPath[0] = '\0';
+        return FALSE;
+    }
+
+    CloseHandle(hProcess);
+    return TRUE;
 }
 
 BOOL IsWatchedProcessName(const char *processName)
@@ -253,23 +337,42 @@ void ResetProcessCpuSample(WatchedProcess *process)
     process->lastSamplePid = 0;
 }
 
+void UpdateProcessLastSeen(WatchedProcess *process)
+{
+    if (!process)
+        return;
+
+    GetLocalTime(&process->lastSeenLocalTime);
+    process->hasLastSeen = TRUE;
+}
+
+void FormatProcessLastSeen(const WatchedProcess *process, char *buffer, size_t bufferSize)
+{
+    if (!buffer || bufferSize == 0)
+        return;
+
+    if (!process || !process->hasLastSeen)
+    {
+        strcpy_s(buffer, bufferSize, "-");
+        return;
+    }
+
+    sprintf_s(buffer, bufferSize, "%04u-%02u-%02u %02u:%02u:%02u",
+              process->lastSeenLocalTime.wYear,
+              process->lastSeenLocalTime.wMonth,
+              process->lastSeenLocalTime.wDay,
+              process->lastSeenLocalTime.wHour,
+              process->lastSeenLocalTime.wMinute,
+              process->lastSeenLocalTime.wSecond);
+}
+
 BOOL GetProcessExecutableNameByPid(DWORD pid, char *processName, size_t processNameSize)
 {
     char processPath[4096];
     char *baseName;
-    DWORD pathSize = sizeof(processPath);
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 
-    if (!hProcess)
+    if (!GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
         return FALSE;
-
-    if (!QueryFullProcessImageNameA(hProcess, 0, processPath, &pathSize))
-    {
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    CloseHandle(hProcess);
 
     baseName = strrchr(processPath, '\\');
     if (baseName)
@@ -360,35 +463,171 @@ BOOL IsProcessRunning(const char *processName, DWORD *pPID, DWORD *pMemoryMB)
     return FALSE;
 }
 
-void SaveSettingsToIni(HWND hwndOwner)
+BOOL SaveSettingsToIni(HWND hwndOwner)
 {
     char settingsPath[MAX_PATH] = {0};
+    char tempPath[MAX_PATH] = {0};
     char keyName[32];
-    char value[32];
+    char value[64];
+    RECT windowRect;
+    WINDOWPLACEMENT windowPlacement = {0};
+    BOOL autoRefreshEnabled;
 
     GetSettingsFilePath(settingsPath, sizeof(settingsPath));
+    if (!GetTempSettingsFilePath(tempPath, sizeof(tempPath)))
+        return FALSE;
 
-    WritePrivateProfileStringA("WatchedProcesses", NULL, NULL, settingsPath);
+    DeleteFileA(tempPath);
+
+    if (!WritePrivateProfileStringA("WatchedProcesses", NULL, NULL, tempPath))
+        return FALSE;
     sprintf_s(value, sizeof(value), "%d", g_AppData.count);
-    WritePrivateProfileStringA("WatchedProcesses", "Count", value, settingsPath);
+    if (!WritePrivateProfileStringA("WatchedProcesses", "Count", value, tempPath))
+        return FALSE;
 
     for (int i = 0; i < g_AppData.count; i++)
     {
         sprintf_s(keyName, sizeof(keyName), "Item%d", i);
-        WritePrivateProfileStringA("WatchedProcesses", keyName, g_AppData.processes[i].name, settingsPath);
+        if (!WritePrivateProfileStringA("WatchedProcesses", keyName, g_AppData.processes[i].name, tempPath))
+            return FALSE;
+    }
+
+    autoRefreshEnabled = IsAutoRefreshEnabled();
+    sprintf_s(value, sizeof(value), "%d", autoRefreshEnabled ? 1 : 0);
+    if (!WritePrivateProfileStringA("General", "AutoRefresh", value, tempPath))
+        return FALSE;
+    sprintf_s(value, sizeof(value), "%d", g_AppData.startWithWindows ? 1 : 0);
+    if (!WritePrivateProfileStringA("General", "StartWithWindows", value, tempPath))
+        return FALSE;
+    sprintf_s(value, sizeof(value), "%d", g_AppData.flashOnStop ? 1 : 0);
+    if (!WritePrivateProfileStringA("General", "FlashOnStop", value, tempPath))
+        return FALSE;
+    sprintf_s(value, sizeof(value), "%d", g_AppData.sortColumn);
+    if (!WritePrivateProfileStringA("General", "SortColumn", value, tempPath))
+        return FALSE;
+    sprintf_s(value, sizeof(value), "%d", g_AppData.sortAscending ? 1 : 0);
+    if (!WritePrivateProfileStringA("General", "SortAscending", value, tempPath))
+        return FALSE;
+
+    if (g_AppData.hwndListView)
+    {
+        for (int i = 0; i < COLUMN_COUNT; i++)
+        {
+            sprintf_s(keyName, sizeof(keyName), "ColumnWidth%d", i);
+            sprintf_s(value, sizeof(value), "%d", ListView_GetColumnWidth(g_AppData.hwndListView, i));
+            if (!WritePrivateProfileStringA("Columns", keyName, value, tempPath))
+                return FALSE;
+        }
     }
 
     sprintf_s(value, sizeof(value), "%d", IsWindowTopmost(hwndOwner) ? 1 : 0);
-    WritePrivateProfileStringA("Window", "KeepOnTop", value, settingsPath);
+    if (!WritePrivateProfileStringA("Window", "KeepOnTop", value, tempPath))
+        return FALSE;
+    if (hwndOwner)
+    {
+        windowPlacement.length = sizeof(windowPlacement);
+        if (GetWindowPlacement(hwndOwner, &windowPlacement))
+            windowRect = windowPlacement.rcNormalPosition;
+        else if (!GetWindowRect(hwndOwner, &windowRect))
+            ZeroMemory(&windowRect, sizeof(windowRect));
+
+        sprintf_s(value, sizeof(value), "%ld", windowRect.left);
+        if (!WritePrivateProfileStringA("Window", "Left", value, tempPath))
+            return FALSE;
+        sprintf_s(value, sizeof(value), "%ld", windowRect.top);
+        if (!WritePrivateProfileStringA("Window", "Top", value, tempPath))
+            return FALSE;
+        sprintf_s(value, sizeof(value), "%ld", windowRect.right - windowRect.left);
+        if (!WritePrivateProfileStringA("Window", "Width", value, tempPath))
+            return FALSE;
+        sprintf_s(value, sizeof(value), "%ld", windowRect.bottom - windowRect.top);
+        if (!WritePrivateProfileStringA("Window", "Height", value, tempPath))
+            return FALSE;
+    }
+
+    if (!MoveFileExA(tempPath, settingsPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+    {
+        DeleteFileA(tempPath);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+BOOL SetStartWithWindowsEnabled(BOOL enabled)
+{
+    HKEY hKey = NULL;
+    char executablePath[MAX_PATH] = {0};
+    char quotedPath[MAX_PATH + 2];
+    LONG result;
+
+    result = RegCreateKeyExA(HKEY_CURRENT_USER, RUN_REGISTRY_PATH, 0, NULL, 0,
+                             KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (result != ERROR_SUCCESS)
+        return FALSE;
+
+    if (enabled)
+    {
+        if (GetModuleFileNameA(NULL, executablePath, sizeof(executablePath)) == 0)
+        {
+            RegCloseKey(hKey);
+            return FALSE;
+        }
+
+        sprintf_s(quotedPath, sizeof(quotedPath), "\"%s\"", executablePath);
+        result = RegSetValueExA(hKey, RUN_REGISTRY_VALUE, 0, REG_SZ,
+                                (const BYTE *)quotedPath, (DWORD)(strlen(quotedPath) + 1));
+    }
+    else
+    {
+        result = RegDeleteValueA(hKey, RUN_REGISTRY_VALUE);
+        if (result == ERROR_FILE_NOT_FOUND)
+            result = ERROR_SUCCESS;
+    }
+
+    RegCloseKey(hKey);
+    return result == ERROR_SUCCESS;
+}
+
+void ShowSettingsSaveError(HWND hwndOwner)
+{
+    char settingsPath[MAX_PATH] = {0};
+    char message[512];
+
+    GetSettingsFilePath(settingsPath, sizeof(settingsPath));
+    sprintf_s(message, sizeof(message),
+              "Unable to save settings or update startup registration.\n\nSettings file:\n%s",
+              settingsPath);
+    MessageBoxA(hwndOwner, message, "Save Settings Failed", MB_OK | MB_ICONERROR);
+}
+
+void SaveSettingsWithFeedback(HWND hwndOwner)
+{
+    if (!SaveSettingsToIni(hwndOwner) || !SetStartWithWindowsEnabled(g_AppData.startWithWindows))
+        ShowSettingsSaveError(hwndOwner);
 }
 
 void LoadSettingsFromIni(HWND hwndOwner)
 {
     char settingsPath[MAX_PATH] = {0};
+    char value[64];
     UINT count;
+    int windowLeft = 0;
+    int windowTop = 0;
+    int windowWidth = 0;
+    int windowHeight = 0;
+    BOOL hasWindowLeft = FALSE;
+    BOOL hasWindowTop = FALSE;
 
     GetSettingsFilePath(settingsPath, sizeof(settingsPath));
     g_AppData.count = 0;
+    g_AppData.autoRefreshEnabled = GetPrivateProfileIntA("General", "AutoRefresh", 1, settingsPath) != 0;
+    g_AppData.startWithWindows = GetPrivateProfileIntA("General", "StartWithWindows", 0, settingsPath) != 0;
+    g_AppData.flashOnStop = GetPrivateProfileIntA("General", "FlashOnStop", 0, settingsPath) != 0;
+    g_AppData.sortColumn = GetPrivateProfileIntA("General", "SortColumn", 0, settingsPath);
+    if (g_AppData.sortColumn < 0 || g_AppData.sortColumn >= COLUMN_COUNT)
+        g_AppData.sortColumn = 0;
+    g_AppData.sortAscending = GetPrivateProfileIntA("General", "SortAscending", 1, settingsPath) != 0;
     count = GetPrivateProfileIntA("WatchedProcesses", "Count", 0, settingsPath);
 
     for (UINT i = 0; i < count && g_AppData.count < MAX_PROCESSES; i++)
@@ -406,6 +645,38 @@ void LoadSettingsFromIni(HWND hwndOwner)
                      sizeof(g_AppData.processes[0].name), processName);
             g_AppData.count++;
         }
+    }
+
+    for (int i = 0; i < COLUMN_COUNT; i++)
+    {
+        char keyName[32];
+        sprintf_s(keyName, sizeof(keyName), "ColumnWidth%d", i);
+        g_AppData.savedColumnWidths[i] = GetPrivateProfileIntA("Columns", keyName, 0, settingsPath);
+    }
+
+    if (GetPrivateProfileStringA("Window", "Left", "", value, sizeof(value), settingsPath) > 0)
+    {
+        windowLeft = atoi(value);
+        hasWindowLeft = TRUE;
+    }
+    if (GetPrivateProfileStringA("Window", "Top", "", value, sizeof(value), settingsPath) > 0)
+    {
+        windowTop = atoi(value);
+        hasWindowTop = TRUE;
+    }
+    windowWidth = GetPrivateProfileIntA("Window", "Width", 0, settingsPath);
+    windowHeight = GetPrivateProfileIntA("Window", "Height", 0, settingsPath);
+    if (windowWidth > 0 && windowHeight > 0 && hasWindowLeft && hasWindowTop)
+    {
+        g_AppData.savedWindowRect.left = windowLeft;
+        g_AppData.savedWindowRect.top = windowTop;
+        g_AppData.savedWindowRect.right = windowLeft + windowWidth;
+        g_AppData.savedWindowRect.bottom = windowTop + windowHeight;
+        g_AppData.hasSavedWindowRect = TRUE;
+    }
+    else
+    {
+        g_AppData.hasSavedWindowRect = FALSE;
     }
 
     if (GetPrivateProfileIntA("Window", "KeepOnTop", 0, settingsPath) != 0)
@@ -439,6 +710,28 @@ int CompareDoubleValues(double left, double right)
     return 0;
 }
 
+int CompareLastSeenValues(const WatchedProcess *left, const WatchedProcess *right)
+{
+    ULONGLONG leftValue;
+    ULONGLONG rightValue;
+
+    if (!left->hasLastSeen && !right->hasLastSeen)
+        return 0;
+    if (!left->hasLastSeen)
+        return -1;
+    if (!right->hasLastSeen)
+        return 1;
+
+    leftValue = SystemTimeToUInt64(left->lastSeenLocalTime);
+    rightValue = SystemTimeToUInt64(right->lastSeenLocalTime);
+
+    if (leftValue < rightValue)
+        return -1;
+    if (leftValue > rightValue)
+        return 1;
+    return 0;
+}
+
 int __cdecl CompareWatchedProcesses(const void *left, const void *right)
 {
     const WatchedProcess *processLeft = (const WatchedProcess *)left;
@@ -461,6 +754,10 @@ int __cdecl CompareWatchedProcesses(const void *left, const void *right)
 
     case 4:
         result = CompareUInt32(processLeft->memoryMB, processRight->memoryMB);
+        break;
+
+    case 5:
+        result = CompareLastSeenValues(processLeft, processRight);
         break;
 
     case 0:
@@ -487,6 +784,114 @@ void SortWatchedProcesses(void)
         qsort(g_AppData.processes, (size_t)g_AppData.count,
               sizeof(g_AppData.processes[0]), CompareWatchedProcesses);
     }
+}
+
+void ApplySavedWindowPlacement(HWND hwnd)
+{
+    if (!hwnd || !g_AppData.hasSavedWindowRect)
+        return;
+
+    SetWindowPos(hwnd, NULL,
+                 g_AppData.savedWindowRect.left,
+                 g_AppData.savedWindowRect.top,
+                 g_AppData.savedWindowRect.right - g_AppData.savedWindowRect.left,
+                 g_AppData.savedWindowRect.bottom - g_AppData.savedWindowRect.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void ApplyAutoRefreshTimer(HWND hwnd)
+{
+    if (!hwnd)
+        return;
+
+    KillTimer(hwnd, ID_REFRESH_TIMER);
+    if (IsAutoRefreshEnabled())
+        SetTimer(hwnd, ID_REFRESH_TIMER, DEFAULT_REFRESH_INTERVAL_MS, NULL);
+}
+
+HMENU CreateMainWindowMenu(void)
+{
+    HMENU hMenuBar = CreateMenu();
+    HMENU hOptionsMenu;
+
+    if (!hMenuBar)
+        return NULL;
+
+    hOptionsMenu = CreatePopupMenu();
+    if (!hOptionsMenu)
+    {
+        DestroyMenu(hMenuBar);
+        return NULL;
+    }
+
+    AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
+    AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_START_WITH_WINDOWS, TEXT("Start with Windows"));
+    AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_FLASH_ON_STOP, TEXT("Flash on Stop"));
+
+    if (!AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hOptionsMenu, TEXT("Options")))
+    {
+        DestroyMenu(hOptionsMenu);
+        DestroyMenu(hMenuBar);
+        return NULL;
+    }
+
+    return hMenuBar;
+}
+
+void UpdateOptionsMenuState(HWND hwnd)
+{
+    HMENU hMenu;
+
+    if (!hwnd)
+        return;
+
+    hMenu = GetMenu(hwnd);
+    if (!hMenu)
+        return;
+
+    CheckMenuItem(hMenu, ID_OPTIONS_AUTO_REFRESH,
+                  MF_BYCOMMAND | (g_AppData.autoRefreshEnabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, ID_OPTIONS_START_WITH_WINDOWS,
+                  MF_BYCOMMAND | (g_AppData.startWithWindows ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, ID_OPTIONS_FLASH_ON_STOP,
+                  MF_BYCOMMAND | (g_AppData.flashOnStop ? MF_CHECKED : MF_UNCHECKED));
+    DrawMenuBar(hwnd);
+}
+
+void UpdateStatusBar(void)
+{
+    char statusText[256];
+    int runningCount = 0;
+
+    if (!g_AppData.hwndStatusBar)
+        return;
+
+    for (int i = 0; i < g_AppData.count; i++)
+    {
+        if (g_AppData.processes[i].running)
+            runningCount++;
+    }
+
+    sprintf_s(statusText, sizeof(statusText),
+              "Watching: %d  Running: %d  Auto-Refresh: %s",
+              g_AppData.count, runningCount,
+              IsAutoRefreshEnabled() ? "On" : "Off");
+    SendMessageA(g_AppData.hwndStatusBar, SB_SETTEXTA, 0, (LPARAM)statusText);
+}
+
+void FlashWatcherWindow(HWND hwnd)
+{
+    FLASHWINFO flashInfo = {0};
+
+    if (!hwnd || IsIconic(hwnd))
+        return;
+
+    flashInfo.cbSize = sizeof(flashInfo);
+    flashInfo.hwnd = hwnd;
+    flashInfo.dwFlags = FLASHW_TRAY | FLASHW_CAPTION;
+    flashInfo.uCount = 3;
+    flashInfo.dwTimeout = 0;
+    FlashWindowEx(&flashInfo);
 }
 
 BOOL GetSelectedProcessName(char *processName, size_t processNameSize)
@@ -524,10 +929,13 @@ void RestoreSelectedProcess(HWND hwndListView, const char *processName)
 void RefreshProcessList(HWND hwndListView)
 {
     char selectedProcessName[256] = {0};
+    BOOL shouldFlashOnStop = FALSE;
+    HWND hwndOwner;
 
     if (!hwndListView)
         return;
 
+    hwndOwner = GetParent(hwndListView);
     GetSelectedProcessName(selectedProcessName, sizeof(selectedProcessName));
 
     SendMessage(hwndListView, WM_SETREDRAW, FALSE, 0);
@@ -538,6 +946,7 @@ void RefreshProcessList(HWND hwndListView)
         DWORD pid = 0;
         DWORD memoryMB = 0;
         double cpuPercent = 0.0;
+        BOOL wasRunning = g_AppData.processes[i].running;
         BOOL running = IsProcessRunning(g_AppData.processes[i].name, &pid, &memoryMB);
         g_AppData.processes[i].running = running;
         g_AppData.processes[i].pid = pid;
@@ -547,11 +956,14 @@ void RefreshProcessList(HWND hwndListView)
         {
             cpuPercent = GetProcessCpuPercent(&g_AppData.processes[i], pid);
             g_AppData.processes[i].cpuPercent = cpuPercent;
+            UpdateProcessLastSeen(&g_AppData.processes[i]);
         }
         else
         {
             ResetProcessCpuSample(&g_AppData.processes[i]);
             g_AppData.processes[i].cpuPercent = 0.0;
+            if (g_AppData.flashOnStop && wasRunning)
+                shouldFlashOnStop = TRUE;
         }
     }
 
@@ -563,6 +975,7 @@ void RefreshProcessList(HWND hwndListView)
         char pidText[32];
         char cpuText[32];
         char memoryText[32];
+        char lastSeenText[32];
 
         if (g_AppData.processes[i].running)
         {
@@ -578,6 +991,8 @@ void RefreshProcessList(HWND hwndListView)
             strcpy_s(cpuText, sizeof(cpuText), "-");
             strcpy_s(memoryText, sizeof(memoryText), "-");
         }
+
+        FormatProcessLastSeen(&g_AppData.processes[i], lastSeenText, sizeof(lastSeenText));
 
         LVITEM lvi = {0};
         lvi.mask = LVIF_TEXT | LVIF_PARAM;
@@ -595,6 +1010,7 @@ void RefreshProcessList(HWND hwndListView)
             ListView_SetItemText(hwndListView, index, 2, pidText);
             ListView_SetItemText(hwndListView, index, 3, cpuText);
             ListView_SetItemText(hwndListView, index, 4, memoryText);
+            ListView_SetItemText(hwndListView, index, 5, lastSeenText);
         }
     }
 
@@ -603,6 +1019,10 @@ void RefreshProcessList(HWND hwndListView)
     SendMessage(hwndListView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hwndListView, NULL, TRUE);
     UpdateWindow(hwndListView);
+    UpdateStatusBar();
+
+    if (shouldFlashOnStop)
+        FlashWatcherWindow(hwndOwner);
 }
 
 void AddProcess(const char *processName)
@@ -632,7 +1052,7 @@ void AddProcess(const char *processName)
              sizeof(g_AppData.processes[0].name), normalizedProcessName);
     g_AppData.count++;
 
-    SaveSettingsToIni(GetParent(g_AppData.hwndListView));
+    SaveSettingsWithFeedback(GetParent(g_AppData.hwndListView));
     RefreshProcessList(g_AppData.hwndListView);
 }
 
@@ -647,7 +1067,7 @@ void RemoveProcess(int index)
     g_AppData.count--;
     ZeroMemory(&g_AppData.processes[g_AppData.count], sizeof(g_AppData.processes[g_AppData.count]));
 
-    SaveSettingsToIni(GetParent(g_AppData.hwndListView));
+    SaveSettingsWithFeedback(GetParent(g_AppData.hwndListView));
     RefreshProcessList(g_AppData.hwndListView);
 }
 
@@ -716,7 +1136,7 @@ void ShowGlobalContextMenu(HWND hwndOwner, POINT screenPoint)
     if (command == ID_CONTEXT_TOGGLE_TOPMOST)
     {
         ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
-        SaveSettingsToIni(hwndOwner);
+        SaveSettingsWithFeedback(hwndOwner);
     }
 }
 
@@ -780,18 +1200,38 @@ void OpenSelectedProcessInTaskManager(HWND hwndOwner)
     if (index == -1 || index >= g_AppData.count)
         return;
 
-    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
-    {
-        MessageBox(hwndOwner, "The selected process is not currently running.",
-                   "Open in Task Manager", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
     result = ShellExecuteA(hwndOwner, "open", "taskmgr.exe", NULL, NULL, SW_SHOWNORMAL);
     if ((INT_PTR)result <= 32)
     {
         MessageBox(hwndOwner, "Failed to open Task Manager.",
                    "Open in Task Manager", MB_OK | MB_ICONERROR);
+    }
+}
+
+void OpenSelectedProcessFileLocation(HWND hwndOwner)
+{
+    int index = GetSelectedProcessIndex();
+    char processPath[MAX_PATH] = {0};
+    char commandLine[MAX_PATH + 32];
+    HINSTANCE result;
+
+    if (index == -1 || index >= g_AppData.count)
+        return;
+
+    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0 ||
+        !GetProcessExecutablePathByPid(g_AppData.processes[index].pid, processPath, sizeof(processPath)))
+    {
+        MessageBoxA(hwndOwner, "The selected process path is only available while the process is running.",
+                    "Open File Location", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    sprintf_s(commandLine, sizeof(commandLine), "/select,\"%s\"", processPath);
+    result = ShellExecuteA(hwndOwner, "open", "explorer.exe", commandLine, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32)
+    {
+        MessageBoxA(hwndOwner, "Failed to open the process file location.",
+                    "Open File Location", MB_OK | MB_ICONERROR);
     }
 }
 
@@ -821,9 +1261,9 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
 {
     int index = -1;
     HMENU hMenu;
-    UINT removeFlags = MF_STRING;
     UINT endProcessFlags = MF_STRING;
-    UINT openTaskManagerFlags = MF_STRING;
+    UINT openLocationFlags = MF_STRING;
+    BOOL watcherTopmost;
     int command;
 
     if (!hwndListView)
@@ -849,31 +1289,43 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     if (index == -1)
         return FALSE;
 
-    if (IsAutoRefreshEnabled())
-        removeFlags |= MF_GRAYED;
     if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
     {
         endProcessFlags |= MF_GRAYED;
-        openTaskManagerFlags |= MF_GRAYED;
+        openLocationFlags |= MF_GRAYED;
     }
+
+    watcherTopmost = IsWindowTopmost(hwndOwner);
 
     hMenu = CreatePopupMenu();
     if (!hMenu)
         return FALSE;
 
-    AppendMenu(hMenu, openTaskManagerFlags, ID_CONTEXT_OPEN_TASK_MANAGER, TEXT("Open Task Manager"));
+    AppendMenu(hMenu, openLocationFlags, ID_CONTEXT_OPEN_FILE_LOCATION, TEXT("Open File Location"));
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, ID_CONTEXT_OPEN_TASK_MANAGER, TEXT("Open Task Manager"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hMenu, removeFlags, ID_CONTEXT_REMOVE_PROCESS, TEXT("Remove Selected"));
+    AppendMenu(hMenu, MF_STRING | (watcherTopmost ? MF_CHECKED : MF_UNCHECKED), ID_CONTEXT_TOGGLE_TOPMOST,
+               watcherTopmost ? TEXT("Turn Off Keep On Top") : TEXT("Keep On Top"));
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, ID_CONTEXT_REMOVE_PROCESS, TEXT("Remove Selected"));
     command = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
                              0, hwndOwner, NULL);
     DestroyMenu(hMenu);
 
-    if (command == ID_CONTEXT_OPEN_TASK_MANAGER)
+    if (command == ID_CONTEXT_OPEN_FILE_LOCATION)
+        OpenSelectedProcessFileLocation(hwndOwner);
+    else if (command == ID_CONTEXT_OPEN_TASK_MANAGER)
         OpenSelectedProcessInTaskManager(hwndOwner);
     else if (command == ID_CONTEXT_END_PROCESS)
         EndSelectedProcess(hwndOwner);
+    else if (command == ID_CONTEXT_TOGGLE_TOPMOST)
+    {
+        ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
+        SaveSettingsWithFeedback(hwndOwner);
+    }
     else if (command == ID_CONTEXT_REMOVE_PROCESS)
         RemoveSelectedProcess();
 
@@ -985,7 +1437,6 @@ void ApplyComboBoxFilter(HWND hwndCombo)
     DWORD editSelection;
     int selectionStart;
     int selectionEnd;
-    BOOL wasDroppedDown;
 
     if (!hwndCombo || g_AppData.bUpdatingComboText)
         return;
@@ -994,18 +1445,12 @@ void ApplyComboBoxFilter(HWND hwndCombo)
     editSelection = (DWORD)SendMessage(hwndCombo, CB_GETEDITSEL, 0, 0);
     selectionStart = LOWORD(editSelection);
     selectionEnd = HIWORD(editSelection);
-    wasDroppedDown = (BOOL)SendMessage(hwndCombo, CB_GETDROPPEDSTATE, 0, 0);
 
     g_AppData.bUpdatingComboText = TRUE;
     PopulateComboBoxFiltered(hwndCombo, typedText);
     SetWindowTextA(hwndCombo, typedText);
     SendMessage(hwndCombo, CB_SETEDITSEL, 0, MAKELPARAM(selectionStart, selectionEnd));
     g_AppData.bUpdatingComboText = FALSE;
-
-    g_AppData.bProgrammaticComboDropdown = TRUE;
-    SendMessage(hwndCombo, CB_SHOWDROPDOWN,
-                (WPARAM)(typedText[0] != '\0' || wasDroppedDown), 0);
-    g_AppData.bProgrammaticComboDropdown = FALSE;
 }
 
 void LayoutControls(HWND hwnd)
@@ -1013,23 +1458,27 @@ void LayoutControls(HWND hwnd)
     RECT clientRect;
     const int margin = 10;
     const int buttonWidth = 130;
-    const int refreshWidth = 95;
-    const int autoRefreshWidth = 110;
     const int rowHeight = 25;
-    const int rowGap = 10;
-    const int bottomSectionHeight = rowHeight + rowGap + rowHeight;
+    int statusBarHeight = 22;
 
     if (!GetClientRect(hwnd, &clientRect))
         return;
 
     {
+        RECT statusRect;
         int clientWidth = clientRect.right - clientRect.left;
         int clientHeight = clientRect.bottom - clientRect.top;
-        int bottomTop = clientHeight - margin - bottomSectionHeight;
-        int buttonY = clientHeight - margin - rowHeight;
-        int autoRefreshY = bottomTop;
-        int listHeight = bottomTop - (margin * 2);
-        int comboWidth = clientWidth - (margin * 5) - (buttonWidth * 2) - refreshWidth;
+        int statusBarTop;
+        int buttonY;
+        int listHeight;
+        int comboWidth = clientWidth - (margin * 4) - (buttonWidth * 2);
+
+        if (g_AppData.hwndStatusBar && GetWindowRect(g_AppData.hwndStatusBar, &statusRect))
+            statusBarHeight = statusRect.bottom - statusRect.top;
+
+        statusBarTop = clientHeight - statusBarHeight;
+        buttonY = statusBarTop - margin - rowHeight;
+        listHeight = buttonY - (margin * 2);
 
         if (comboWidth < 120)
             comboWidth = 120;
@@ -1040,10 +1489,6 @@ void LayoutControls(HWND hwnd)
             MoveWindow(g_AppData.hwndListView, margin, margin,
                        clientWidth - (margin * 2), listHeight, TRUE);
 
-        if (g_AppData.hwndAutoRefresh)
-            MoveWindow(g_AppData.hwndAutoRefresh, margin, autoRefreshY,
-                       autoRefreshWidth, 20, TRUE);
-
         if (g_AppData.hwndProcessCombo)
             MoveWindow(g_AppData.hwndProcessCombo, margin, buttonY,
                        comboWidth, 200, TRUE);
@@ -1053,13 +1498,12 @@ void LayoutControls(HWND hwnd)
                        buttonWidth, rowHeight, TRUE);
 
         if (g_AppData.hwndRemoveButton)
-            MoveWindow(g_AppData.hwndRemoveButton,
-                       clientWidth - margin - refreshWidth - margin - buttonWidth,
+            MoveWindow(g_AppData.hwndRemoveButton, clientWidth - margin - buttonWidth,
                        buttonY, buttonWidth, rowHeight, TRUE);
 
-        if (g_AppData.hwndRefreshButton)
-            MoveWindow(g_AppData.hwndRefreshButton, clientWidth - margin - refreshWidth,
-                       buttonY, refreshWidth, rowHeight, TRUE);
+        if (g_AppData.hwndStatusBar)
+            MoveWindow(g_AppData.hwndStatusBar, 0, statusBarTop,
+                       clientWidth, statusBarHeight, TRUE);
     }
 }
 
@@ -1069,7 +1513,7 @@ void GetMinimumWindowSize(HWND hwnd, int *minWidth, int *minHeight)
     DWORD style = (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE);
     DWORD exStyle = (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
 
-    AdjustWindowRectEx(&minClientRect, style, FALSE, exStyle);
+    AdjustWindowRectEx(&minClientRect, style, GetMenu(hwnd) != NULL, exStyle);
 
     if (minWidth)
         *minWidth = minClientRect.right - minClientRect.left;
@@ -1083,15 +1527,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
     {
-        g_AppData.sortColumn = 0;
-        g_AppData.sortAscending = TRUE;
+        HMENU hMenuBar;
+
         LoadSettingsFromIni(hwnd);
+
+        hMenuBar = CreateMainWindowMenu();
+        if (hMenuBar)
+            SetMenu(hwnd, hMenuBar);
 
         g_AppData.hwndProcessCombo = CreateWindow(TEXT("COMBOBOX"), TEXT(""),
                                                   WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
                                                       CBS_DROPDOWN | CBS_AUTOHSCROLL,
                                                   10, 10, 200, 200,
                                                   hwnd, (HMENU)IDC_PROCESS_NAME, GetModuleHandle(NULL), NULL);
+        SetWindowSubclass(g_AppData.hwndProcessCombo, ComboOpenOnClickProc, 1, 0);
+        {
+            COMBOBOXINFO comboInfo = {0};
+            comboInfo.cbSize = sizeof(comboInfo);
+            if (GetComboBoxInfo(g_AppData.hwndProcessCombo, &comboInfo) && comboInfo.hwndItem)
+                SetWindowSubclass(comboInfo.hwndItem, ComboOpenOnClickProc, 2, 0);
+        }
         PopulateComboBox(g_AppData.hwndProcessCombo);
 
         g_AppData.hwndAddButton = CreateWindow(TEXT("BUTTON"), TEXT("Add Process"),
@@ -1104,22 +1559,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                                                   360, 10, 130, 25,
                                                   hwnd, (HMENU)IDC_REMOVE_BUTTON, GetModuleHandle(NULL), NULL);
 
-        g_AppData.hwndRefreshButton = CreateWindow(TEXT("BUTTON"), TEXT("Refresh"),
-                                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                   500, 10, 95, 25,
-                                                   hwnd, (HMENU)IDC_REFRESH_BUTTON, GetModuleHandle(NULL), NULL);
-
-        CreateWindow(TEXT("BUTTON"), TEXT("Auto-Refresh"),
-                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                     10, 45, 110, 20,
-                     hwnd, (HMENU)IDC_AUTO_REFRESH, GetModuleHandle(NULL), NULL);
-        g_AppData.hwndAutoRefresh = GetDlgItem(hwnd, IDC_AUTO_REFRESH);
-        SendMessage(g_AppData.hwndAutoRefresh, BM_SETCHECK, BST_CHECKED, 0);
-
         g_AppData.hwndListView = CreateWindow(WC_LISTVIEW, TEXT(""),
-                                              WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LVS_REPORT | LVS_SINGLESEL,
+                                              WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
+                                                  LVS_REPORT | LVS_SINGLESEL,
                                               10, 75, 490, 250,
                                               hwnd, (HMENU)IDC_LISTBOX, GetModuleHandle(NULL), NULL);
+
+        g_AppData.hwndStatusBar = CreateWindow(STATUSCLASSNAME, TEXT(""),
+                                               WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                                               0, 0, 0, 0,
+                                               hwnd, (HMENU)IDC_STATUS_BAR, GetModuleHandle(NULL), NULL);
 
         SendMessage(g_AppData.hwndListView, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
                     LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
@@ -1148,12 +1597,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             lvc.cx = 90;
             lvc.pszText = TEXT("Memory");
             SendMessage(g_AppData.hwndListView, LVM_INSERTCOLUMN, 4, (LPARAM)&lvc);
+
+            lvc.cx = 150;
+            lvc.pszText = TEXT("Last Seen");
+            SendMessage(g_AppData.hwndListView, LVM_INSERTCOLUMN, 5, (LPARAM)&lvc);
         }
 
+        for (int i = 0; i < COLUMN_COUNT; i++)
+        {
+            if (g_AppData.savedColumnWidths[i] > 0)
+                ListView_SetColumnWidth(g_AppData.hwndListView, i, g_AppData.savedColumnWidths[i]);
+        }
+
+        ApplySavedWindowPlacement(hwnd);
+        UpdateOptionsMenuState(hwnd);
         LayoutControls(hwnd);
-        UpdateManualRefreshControls();
         RefreshProcessList(g_AppData.hwndListView);
-        SetTimer(hwnd, ID_REFRESH_TIMER, 1000, NULL);
+        UpdateStatusBar();
+        ApplyAutoRefreshTimer(hwnd);
         return 0;
     }
 
@@ -1190,15 +1651,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 SetFocus(hwndCombo);
             }
         }
-        else if (id == IDC_PROCESS_NAME && (notif == CBN_DROPDOWN || notif == CBN_KILLFOCUS))
+        else if (id == IDC_PROCESS_NAME && notif == CBN_DROPDOWN)
         {
             HWND hwndCombo = GetDlgItem(hwnd, IDC_PROCESS_NAME);
 
-            if (notif == CBN_DROPDOWN && g_AppData.bProgrammaticComboDropdown)
-                return 0;
-
             KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
             RefreshComboBoxForCurrentText(hwndCombo);
+        }
+        else if (id == IDC_PROCESS_NAME && notif == CBN_KILLFOCUS)
+        {
+            KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
         }
         else if (id == IDC_PROCESS_NAME && notif == CBN_EDITCHANGE)
         {
@@ -1209,20 +1671,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         {
             RemoveSelectedProcess();
         }
-        else if (id == IDC_REFRESH_BUTTON)
+        else if (id == ID_OPTIONS_AUTO_REFRESH)
         {
-            RefreshProcessList(g_AppData.hwndListView);
-        }
-        else if (id == IDC_AUTO_REFRESH)
-        {
-            if (IsAutoRefreshEnabled())
-                SetTimer(hwnd, ID_REFRESH_TIMER, 1000, NULL);
-            else
-                KillTimer(hwnd, ID_REFRESH_TIMER);
-
-            UpdateManualRefreshControls();
+            g_AppData.autoRefreshEnabled = !g_AppData.autoRefreshEnabled;
+            ApplyAutoRefreshTimer(hwnd);
+            UpdateStatusBar();
+            UpdateOptionsMenuState(hwnd);
+            SaveSettingsWithFeedback(hwnd);
             InvalidateRect(g_AppData.hwndListView, NULL, TRUE);
             UpdateWindow(g_AppData.hwndListView);
+        }
+        else if (id == ID_OPTIONS_START_WITH_WINDOWS)
+        {
+            g_AppData.startWithWindows = !g_AppData.startWithWindows;
+            UpdateOptionsMenuState(hwnd);
+            SaveSettingsWithFeedback(hwnd);
+        }
+        else if (id == ID_OPTIONS_FLASH_ON_STOP)
+        {
+            g_AppData.flashOnStop = !g_AppData.flashOnStop;
+            UpdateStatusBar();
+            UpdateOptionsMenuState(hwnd);
+            SaveSettingsWithFeedback(hwnd);
         }
         return 0;
     }
@@ -1297,8 +1767,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 return 0;
         }
 
-        ShowGlobalContextMenu(hwnd, screenPoint);
-        return 0;
+        if ((HWND)wParam == hwnd)
+        {
+            ShowGlobalContextMenu(hwnd, screenPoint);
+            return 0;
+        }
+
+        break;
     }
 
     case WM_SIZE:
@@ -1324,7 +1799,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         KillTimer(hwnd, ID_REFRESH_TIMER);
         KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
-        SaveSettingsToIni(hwnd);
+        SaveSettingsWithFeedback(hwnd);
         PostQuitMessage(0);
         return 0;
     }
@@ -1346,7 +1821,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     (void)lpCmdLine;
 
     icex.dwSize = sizeof(icex);
-    icex.dwICC = ICC_LISTVIEW_CLASSES;
+    icex.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
     InitCommonControlsEx(&icex);
 
     hLargeIcon = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_APP_ICON),
@@ -1374,7 +1849,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             CLASS_NAME,
             "ProcessWatcher",
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 560, 270,
+            CW_USEDEFAULT, CW_USEDEFAULT, 760, 340,
             NULL, NULL, hInstance, NULL);
 
         if (!hwnd)
