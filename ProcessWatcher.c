@@ -25,10 +25,11 @@
 #define ID_CONTEXT_OPEN_FILE_LOCATION 40005
 #define ID_OPTIONS_AUTO_REFRESH 40006
 #define ID_OPTIONS_START_WITH_WINDOWS 40007
-#define ID_OPTIONS_FLASH_ON_STOP 40008
-#define ID_FORCE_REFRESH 40009
-#define ID_FILE_EXIT 40010
+#define ID_FORCE_REFRESH 40008
+#define ID_FILE_EXIT 40009
+#define ID_OPTIONS_NOTIFY_ON_STOP 40010
 #define IDI_APP_ICON 101
+#define NOTIFICATION_ICON_ID 1
 #define SETTINGS_FILE_NAME "ProcessWatcher.ini"
 #define RUN_REGISTRY_PATH "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define RUN_REGISTRY_VALUE "ProcessWatcher"
@@ -60,7 +61,8 @@ typedef struct
     BOOL bUpdatingComboText;
     BOOL autoRefreshEnabled;
     BOOL startWithWindows;
-    BOOL flashOnStop;
+    BOOL notifyOnStop;
+    BOOL notificationIconAdded;
     int sortColumn;
     BOOL sortAscending;
     RECT savedWindowRect;
@@ -90,9 +92,12 @@ void UpdateStatusBar(void);
 void ApplyAutoRefreshTimer(HWND hwnd);
 BOOL SetStartWithWindowsEnabled(BOOL enabled);
 void ApplySavedWindowPlacement(HWND hwnd);
-void FlashWatcherWindow(HWND hwnd);
 HMENU CreateMainWindowMenu(void);
 void UpdateOptionsMenuState(HWND hwnd);
+void UpdateRemoveButtonState(void);
+BOOL EnsureNotificationIcon(HWND hwnd);
+void RemoveNotificationIcon(HWND hwnd);
+void ShowStopNotification(HWND hwnd, const char *message);
 
 BOOL IsAutoRefreshEnabled(void)
 {
@@ -501,8 +506,8 @@ BOOL SaveSettingsToIni(HWND hwndOwner)
     sprintf_s(value, sizeof(value), "%d", g_AppData.startWithWindows ? 1 : 0);
     if (!WritePrivateProfileStringA("General", "StartWithWindows", value, tempPath))
         return FALSE;
-    sprintf_s(value, sizeof(value), "%d", g_AppData.flashOnStop ? 1 : 0);
-    if (!WritePrivateProfileStringA("General", "FlashOnStop", value, tempPath))
+    sprintf_s(value, sizeof(value), "%d", g_AppData.notifyOnStop ? 1 : 0);
+    if (!WritePrivateProfileStringA("General", "NotifyOnStop", value, tempPath))
         return FALSE;
     sprintf_s(value, sizeof(value), "%d", g_AppData.sortColumn);
     if (!WritePrivateProfileStringA("General", "SortColumn", value, tempPath))
@@ -625,7 +630,7 @@ void LoadSettingsFromIni(HWND hwndOwner)
     g_AppData.count = 0;
     g_AppData.autoRefreshEnabled = GetPrivateProfileIntA("General", "AutoRefresh", 1, settingsPath) != 0;
     g_AppData.startWithWindows = GetPrivateProfileIntA("General", "StartWithWindows", 0, settingsPath) != 0;
-    g_AppData.flashOnStop = GetPrivateProfileIntA("General", "FlashOnStop", 0, settingsPath) != 0;
+    g_AppData.notifyOnStop = GetPrivateProfileIntA("General", "NotifyOnStop", 0, settingsPath) != 0;
     g_AppData.sortColumn = GetPrivateProfileIntA("General", "SortColumn", 0, settingsPath);
     if (g_AppData.sortColumn < 0 || g_AppData.sortColumn >= COLUMN_COUNT)
         g_AppData.sortColumn = 0;
@@ -838,7 +843,7 @@ HMENU CreateMainWindowMenu(void)
     AppendMenu(hFileMenu, MF_STRING, ID_FILE_EXIT, TEXT("Exit"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_START_WITH_WINDOWS, TEXT("Start with Windows"));
-    AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_FLASH_ON_STOP, TEXT("Flash on Stop"));
+    AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_NOTIFY_ON_STOP, TEXT("Notify on Stop"));
 
     if (!AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, TEXT("File")) ||
         !AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hOptionsMenu, TEXT("Options")))
@@ -867,9 +872,78 @@ void UpdateOptionsMenuState(HWND hwnd)
                   MF_BYCOMMAND | (g_AppData.autoRefreshEnabled ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, ID_OPTIONS_START_WITH_WINDOWS,
                   MF_BYCOMMAND | (g_AppData.startWithWindows ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(hMenu, ID_OPTIONS_FLASH_ON_STOP,
-                  MF_BYCOMMAND | (g_AppData.flashOnStop ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, ID_OPTIONS_NOTIFY_ON_STOP,
+                  MF_BYCOMMAND | (g_AppData.notifyOnStop ? MF_CHECKED : MF_UNCHECKED));
     DrawMenuBar(hwnd);
+}
+
+BOOL EnsureNotificationIcon(HWND hwnd)
+{
+    NOTIFYICONDATAA nid = {0};
+    HICON hIcon;
+
+    if (!hwnd)
+        return FALSE;
+    if (g_AppData.notificationIconAdded)
+        return TRUE;
+
+    hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (!hIcon)
+        hIcon = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APP_ICON),
+                                 IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    if (!hIcon)
+        hIcon = LoadIcon(NULL, IDI_APPLICATION);
+
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIFICATION_ICON_ID;
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_STATE;
+    nid.hIcon = hIcon;
+    nid.dwState = NIS_HIDDEN;
+    nid.dwStateMask = NIS_HIDDEN;
+    strcpy_s(nid.szTip, sizeof(nid.szTip), "ProcessWatcher");
+
+    if (!Shell_NotifyIconA(NIM_ADD, &nid))
+        return FALSE;
+
+    nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconA(NIM_SETVERSION, &nid);
+    g_AppData.notificationIconAdded = TRUE;
+    return TRUE;
+}
+
+void RemoveNotificationIcon(HWND hwnd)
+{
+    NOTIFYICONDATAA nid = {0};
+
+    if (!hwnd || !g_AppData.notificationIconAdded)
+        return;
+
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIFICATION_ICON_ID;
+    Shell_NotifyIconA(NIM_DELETE, &nid);
+    g_AppData.notificationIconAdded = FALSE;
+}
+
+void ShowStopNotification(HWND hwnd, const char *message)
+{
+    NOTIFYICONDATAA nid = {0};
+
+    if (!hwnd || !message || message[0] == '\0')
+        return;
+    if (!EnsureNotificationIcon(hwnd))
+        return;
+
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIFICATION_ICON_ID;
+    nid.uFlags = NIF_INFO;
+    strcpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle), "Process Stopped");
+    strcpy_s(nid.szInfo, sizeof(nid.szInfo), message);
+    nid.dwInfoFlags = NIIF_WARNING;
+    nid.uTimeout = 5000;
+    Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
 
 void UpdateStatusBar(void)
@@ -893,19 +967,14 @@ void UpdateStatusBar(void)
     SendMessageA(g_AppData.hwndStatusBar, SB_SETTEXTA, 0, (LPARAM)statusText);
 }
 
-void FlashWatcherWindow(HWND hwnd)
+void UpdateRemoveButtonState(void)
 {
-    FLASHWINFO flashInfo = {0};
-
-    if (!hwnd || IsIconic(hwnd))
+    if (!g_AppData.hwndRemoveButton)
         return;
 
-    flashInfo.cbSize = sizeof(flashInfo);
-    flashInfo.hwnd = hwnd;
-    flashInfo.dwFlags = FLASHW_TRAY | FLASHW_CAPTION;
-    flashInfo.uCount = 3;
-    flashInfo.dwTimeout = 0;
-    FlashWindowEx(&flashInfo);
+    EnableWindow(g_AppData.hwndRemoveButton,
+                 g_AppData.hwndListView &&
+                     SendMessage(g_AppData.hwndListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED) != -1);
 }
 
 BOOL GetSelectedProcessName(char *processName, size_t processNameSize)
@@ -943,7 +1012,8 @@ void RestoreSelectedProcess(HWND hwndListView, const char *processName)
 void RefreshProcessList(HWND hwndListView)
 {
     char selectedProcessName[256] = {0};
-    BOOL shouldFlashOnStop = FALSE;
+    int stoppedCount = 0;
+    char firstStoppedProcess[256] = {0};
     HWND hwndOwner;
 
     if (!hwndListView)
@@ -976,8 +1046,12 @@ void RefreshProcessList(HWND hwndListView)
         {
             ResetProcessCpuSample(&g_AppData.processes[i]);
             g_AppData.processes[i].cpuPercent = 0.0;
-            if (g_AppData.flashOnStop && wasRunning)
-                shouldFlashOnStop = TRUE;
+            if (wasRunning)
+            {
+                if (stoppedCount == 0)
+                    strcpy_s(firstStoppedProcess, sizeof(firstStoppedProcess), g_AppData.processes[i].name);
+                stoppedCount++;
+            }
         }
     }
 
@@ -1033,10 +1107,27 @@ void RefreshProcessList(HWND hwndListView)
     SendMessage(hwndListView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hwndListView, NULL, TRUE);
     UpdateWindow(hwndListView);
+    UpdateRemoveButtonState();
     UpdateStatusBar();
+    if (g_AppData.notifyOnStop && stoppedCount > 0)
+    {
+        char notificationMessage[256];
 
-    if (shouldFlashOnStop)
-        FlashWatcherWindow(hwndOwner);
+        if (stoppedCount == 1)
+        {
+            sprintf_s(notificationMessage, sizeof(notificationMessage),
+                      "%s has stopped running.", firstStoppedProcess);
+        }
+        else
+        {
+            sprintf_s(notificationMessage, sizeof(notificationMessage),
+                      "%s and %d other watched process%s stopped.",
+                      firstStoppedProcess, stoppedCount - 1,
+                      stoppedCount == 2 ? "" : "es");
+        }
+
+        ShowStopNotification(hwndOwner, notificationMessage);
+    }
 }
 
 void AddProcess(const char *processName)
@@ -1626,6 +1717,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         ApplySavedWindowPlacement(hwnd);
         UpdateOptionsMenuState(hwnd);
         LayoutControls(hwnd);
+        UpdateRemoveButtonState();
         RefreshProcessList(g_AppData.hwndListView);
         UpdateStatusBar();
         ApplyAutoRefreshTimer(hwnd);
@@ -1709,10 +1801,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             UpdateOptionsMenuState(hwnd);
             SaveSettingsWithFeedback(hwnd);
         }
-        else if (id == ID_OPTIONS_FLASH_ON_STOP)
+        else if (id == ID_OPTIONS_NOTIFY_ON_STOP)
         {
-            g_AppData.flashOnStop = !g_AppData.flashOnStop;
-            UpdateStatusBar();
+            g_AppData.notifyOnStop = !g_AppData.notifyOnStop;
             UpdateOptionsMenuState(hwnd);
             SaveSettingsWithFeedback(hwnd);
         }
@@ -1774,6 +1865,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 return CDRF_DODEFAULT;
             }
         }
+        else if (pnmh->idFrom == IDC_LISTBOX && pnmh->code == LVN_ITEMCHANGED)
+        {
+            UpdateRemoveButtonState();
+        }
         break;
     }
 
@@ -1821,6 +1916,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         KillTimer(hwnd, ID_REFRESH_TIMER);
         KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
+        RemoveNotificationIcon(hwnd);
         SaveSettingsWithFeedback(hwnd);
         PostQuitMessage(0);
         return 0;

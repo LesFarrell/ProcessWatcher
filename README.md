@@ -11,8 +11,16 @@ A lightweight Windows GUI application written in C using the Win32 API to monito
 - Allows typing process names directly for processes not running
 - Real-time status display (RUNNING/STOPPED) with memory usage
 - Shows PID (Process ID) and memory consumption in MB when running
+- Shows CPU usage and last-seen timestamp for watched processes
 - Color-coded display (Green = Running, Red = Stopped)
-- Auto-refresh mode for continuous monitoring (1-second intervals)
+- Auto-refresh mode for continuous monitoring at a fixed 1-second interval
+- `File` menu with an `Exit` command
+- `Options` menu for Auto-Refresh, Start with Windows, and Notify on Stop
+- Windows notification when a watched process stops
+- `F5` keyboard shortcut for manual refresh
+- List view right-click actions for open file location, Task Manager, end process, keep on top, and remove
+- `Remove Selected` disables automatically when nothing is selected
+- Saves watched processes and `Keep On Top` state in `ProcessWatcher.ini`
 - Case-insensitive process name matching
 - Lightweight native Win32 executable
 
@@ -58,10 +66,14 @@ ProcessWatcher.exe
    - **Process Name**: Name of the watched process
    - **Status**: RUNNING or STOPPED status
    - **PID**: Process ID (shown when running)
+   - **CPU %**: CPU usage for running processes
    - **Memory**: Memory usage in MB (shown when running)
-3. **Refresh**: Click "Refresh" to manually check all process statuses and update memory readings
-4. **Auto-Refresh**: Check "Auto-Refresh" to continuously monitor processes (updates every 1 second)
-5. **Remove**: Select a process in the table and click "Remove Selected"
+   - **Last Seen**: Last observed running timestamp
+3. **Refresh**: Press `F5` to force an immediate refresh
+4. **Options**: Use the `Options` menu to toggle Auto-Refresh, Start with Windows, and Notify on Stop
+5. **Remove**: Select a process in the table and click "Remove Selected" (the button is disabled when nothing is selected)
+6. **Context Menu**: Right-click a watched process to open its file location, open Task Manager, end the process, toggle Keep On Top, or remove it
+7. **File Menu**: Use `File -> Exit` to close the application
 
 ## Notes
 
@@ -70,12 +82,15 @@ ProcessWatcher.exe
 - The combo box dropdown shows all currently running processes for easy selection
 - Process list in combo box updates automatically when the combo loses focus
 - Memory usage shown is the working set size in MB for running processes
+- CPU usage is sampled during refreshes and auto-refresh ticks
 - The program uses Win32 API's `CreateToolhelp32Snapshot` for efficient process enumeration
 - Memory metrics are retrieved using `GetProcessMemoryInfo`
-- Auto-refresh uses the window timer/message loop, avoiding a background thread shutdown race
+- Auto-refresh uses a fixed 1-second window timer/message loop, avoiding a background thread shutdown race
+- Watched processes and window `Keep On Top` state are persisted in `ProcessWatcher.ini`
+- Stop notifications use the Windows notification system and depend on the shell/taskbar being available
 - The executable icon is embedded from `ProcessWatcher.ico` via `ProcessWatcher.rc`
 - No external dependencies required once compiled
-- Window size: 520x370 pixels
+- Default window size: 760x340 pixels
 
 ## Building with MSVC
 
