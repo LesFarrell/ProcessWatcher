@@ -23,6 +23,7 @@
 #define ID_CONTEXT_TOGGLE_TOPMOST 40003
 #define ID_CONTEXT_OPEN_TASK_MANAGER 40004
 #define ID_CONTEXT_OPEN_FILE_LOCATION 40005
+#define ID_CONTEXT_START_PROCESS 40011
 #define ID_OPTIONS_AUTO_REFRESH 40006
 #define ID_OPTIONS_START_WITH_WINDOWS 40007
 #define ID_FORCE_REFRESH 40008
@@ -47,6 +48,7 @@ typedef struct
     DWORD lastSamplePid;
     SYSTEMTIME lastSeenLocalTime;
     BOOL hasLastSeen;
+    char executablePath[MAX_PATH];
 } WatchedProcess;
 
 typedef struct
@@ -63,6 +65,8 @@ typedef struct
     BOOL startWithWindows;
     BOOL notifyOnStop;
     BOOL notificationIconAdded;
+    SYSTEMTIME lastRefreshLocalTime;
+    BOOL hasLastRefresh;
     int sortColumn;
     BOOL sortAscending;
     RECT savedWindowRect;
@@ -95,9 +99,12 @@ void ApplySavedWindowPlacement(HWND hwnd);
 HMENU CreateMainWindowMenu(void);
 void UpdateOptionsMenuState(HWND hwnd);
 void UpdateRemoveButtonState(void);
+void UpdateListSortIndicators(void);
 BOOL EnsureNotificationIcon(HWND hwnd);
 void RemoveNotificationIcon(HWND hwnd);
 void ShowStopNotification(HWND hwnd, const char *message);
+BOOL GetKnownProcessExecutablePath(const WatchedProcess *process, char *processPath, size_t processPathSize);
+void StartSelectedProcess(HWND hwndOwner);
 
 BOOL IsAutoRefreshEnabled(void)
 {
@@ -371,6 +378,23 @@ void FormatProcessLastSeen(const WatchedProcess *process, char *buffer, size_t b
               process->lastSeenLocalTime.wHour,
               process->lastSeenLocalTime.wMinute,
               process->lastSeenLocalTime.wSecond);
+}
+
+BOOL GetKnownProcessExecutablePath(const WatchedProcess *process, char *processPath, size_t processPathSize)
+{
+    if (!process || !processPath || processPathSize == 0)
+        return FALSE;
+
+    processPath[0] = '\0';
+
+    if (process->running && process->pid != 0 &&
+        GetProcessExecutablePathByPid(process->pid, processPath, processPathSize))
+    {
+        return TRUE;
+    }
+
+    return process->executablePath[0] != '\0' &&
+           strcpy_s(processPath, processPathSize, process->executablePath) == 0;
 }
 
 BOOL GetProcessExecutableNameByPid(DWORD pid, char *processName, size_t processNameSize)
@@ -840,6 +864,8 @@ HMENU CreateMainWindowMenu(void)
         return NULL;
     }
 
+    AppendMenu(hFileMenu, MF_STRING, ID_FORCE_REFRESH, TEXT("Refresh Now\tF5"));
+    AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hFileMenu, MF_STRING, ID_FILE_EXIT, TEXT("Exit"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_START_WITH_WINDOWS, TEXT("Start with Windows"));
@@ -874,7 +900,36 @@ void UpdateOptionsMenuState(HWND hwnd)
                   MF_BYCOMMAND | (g_AppData.startWithWindows ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, ID_OPTIONS_NOTIFY_ON_STOP,
                   MF_BYCOMMAND | (g_AppData.notifyOnStop ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(hMenu, ID_FORCE_REFRESH,
+                   MF_BYCOMMAND | (g_AppData.autoRefreshEnabled ? MF_GRAYED : MF_ENABLED));
     DrawMenuBar(hwnd);
+}
+
+void UpdateListSortIndicators(void)
+{
+    HWND hwndHeader;
+
+    if (!g_AppData.hwndListView)
+        return;
+
+    hwndHeader = ListView_GetHeader(g_AppData.hwndListView);
+    if (!hwndHeader)
+        return;
+
+    for (int i = 0; i < COLUMN_COUNT; i++)
+    {
+        HDITEM item = {0};
+
+        item.mask = HDI_FORMAT;
+        if (!Header_GetItem(hwndHeader, i, &item))
+            continue;
+
+        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == g_AppData.sortColumn)
+            item.fmt |= g_AppData.sortAscending ? HDF_SORTUP : HDF_SORTDOWN;
+
+        Header_SetItem(hwndHeader, i, &item);
+    }
 }
 
 BOOL EnsureNotificationIcon(HWND hwnd)
@@ -961,9 +1016,9 @@ void UpdateStatusBar(void)
     }
 
     sprintf_s(statusText, sizeof(statusText),
-              "Watching: %d  Running: %d  Auto-Refresh: %s",
+              "Watching: %d  Running: %d  Refresh: %s",
               g_AppData.count, runningCount,
-              IsAutoRefreshEnabled() ? "On" : "Off");
+              IsAutoRefreshEnabled() ? "Auto" : "Paused");
     SendMessageA(g_AppData.hwndStatusBar, SB_SETTEXTA, 0, (LPARAM)statusText);
 }
 
@@ -1038,9 +1093,13 @@ void RefreshProcessList(HWND hwndListView)
 
         if (running)
         {
+            char processPath[MAX_PATH] = {0};
+
             cpuPercent = GetProcessCpuPercent(&g_AppData.processes[i], pid);
             g_AppData.processes[i].cpuPercent = cpuPercent;
             UpdateProcessLastSeen(&g_AppData.processes[i]);
+            if (GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
+                strcpy_s(g_AppData.processes[i].executablePath, sizeof(g_AppData.processes[i].executablePath), processPath);
         }
         else
         {
@@ -1107,6 +1166,8 @@ void RefreshProcessList(HWND hwndListView)
     SendMessage(hwndListView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hwndListView, NULL, TRUE);
     UpdateWindow(hwndListView);
+    GetLocalTime(&g_AppData.lastRefreshLocalTime);
+    g_AppData.hasLastRefresh = TRUE;
     UpdateRemoveButtonState();
     UpdateStatusBar();
     if (g_AppData.notifyOnStop && stoppedCount > 0)
@@ -1323,10 +1384,9 @@ void OpenSelectedProcessFileLocation(HWND hwndOwner)
     if (index == -1 || index >= g_AppData.count)
         return;
 
-    if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0 ||
-        !GetProcessExecutablePathByPid(g_AppData.processes[index].pid, processPath, sizeof(processPath)))
+    if (!GetKnownProcessExecutablePath(&g_AppData.processes[index], processPath, sizeof(processPath)))
     {
-        MessageBoxA(hwndOwner, "The selected process path is only available while the process is running.",
+        MessageBoxA(hwndOwner, "The selected process path is not known yet.",
                     "Open File Location", MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -1338,6 +1398,40 @@ void OpenSelectedProcessFileLocation(HWND hwndOwner)
         MessageBoxA(hwndOwner, "Failed to open the process file location.",
                     "Open File Location", MB_OK | MB_ICONERROR);
     }
+}
+
+void StartSelectedProcess(HWND hwndOwner)
+{
+    int index = GetSelectedProcessIndex();
+    char processPath[MAX_PATH] = {0};
+    HINSTANCE result;
+
+    if (index == -1 || index >= g_AppData.count)
+        return;
+
+    if (g_AppData.processes[index].running)
+    {
+        MessageBoxA(hwndOwner, "The selected process is already running.",
+                    "Start Process", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if (!GetKnownProcessExecutablePath(&g_AppData.processes[index], processPath, sizeof(processPath)))
+    {
+        MessageBoxA(hwndOwner, "The selected process can only be started after its executable path has been discovered.",
+                    "Start Process", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    result = ShellExecuteA(hwndOwner, "open", processPath, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32)
+    {
+        MessageBoxA(hwndOwner, "Failed to start the selected process.",
+                    "Start Process", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    RefreshProcessList(g_AppData.hwndListView);
 }
 
 BOOL TrySelectListViewItemAtScreenPoint(HWND hwndListView, POINT screenPoint, int *pIndex)
@@ -1365,10 +1459,13 @@ BOOL TrySelectListViewItemAtScreenPoint(HWND hwndListView, POINT screenPoint, in
 BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoint)
 {
     int index = -1;
+    char processPath[MAX_PATH] = {0};
     HMENU hMenu;
     UINT endProcessFlags = MF_STRING;
+    UINT startProcessFlags = MF_STRING;
     UINT openLocationFlags = MF_STRING;
     BOOL watcherTopmost;
+    BOOL hasKnownPath;
     int command;
 
     if (!hwndListView)
@@ -1394,11 +1491,14 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     if (index == -1)
         return FALSE;
 
+    hasKnownPath = GetKnownProcessExecutablePath(&g_AppData.processes[index], processPath, sizeof(processPath));
+
     if (!g_AppData.processes[index].running || g_AppData.processes[index].pid == 0)
-    {
         endProcessFlags |= MF_GRAYED;
+    if (g_AppData.processes[index].running || !hasKnownPath)
+        startProcessFlags |= MF_GRAYED;
+    if (!hasKnownPath)
         openLocationFlags |= MF_GRAYED;
-    }
 
     watcherTopmost = IsWindowTopmost(hwndOwner);
 
@@ -1409,6 +1509,8 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     AppendMenu(hMenu, openLocationFlags, ID_CONTEXT_OPEN_FILE_LOCATION, TEXT("Open File Location"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, ID_CONTEXT_OPEN_TASK_MANAGER, TEXT("Open Task Manager"));
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, startProcessFlags, ID_CONTEXT_START_PROCESS, TEXT("Start Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -1424,6 +1526,8 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
         OpenSelectedProcessFileLocation(hwndOwner);
     else if (command == ID_CONTEXT_OPEN_TASK_MANAGER)
         OpenSelectedProcessInTaskManager(hwndOwner);
+    else if (command == ID_CONTEXT_START_PROCESS)
+        StartSelectedProcess(hwndOwner);
     else if (command == ID_CONTEXT_END_PROCESS)
         EndSelectedProcess(hwndOwner);
     else if (command == ID_CONTEXT_TOGGLE_TOPMOST)
@@ -1714,6 +1818,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 ListView_SetColumnWidth(g_AppData.hwndListView, i, g_AppData.savedColumnWidths[i]);
         }
 
+        UpdateListSortIndicators();
         ApplySavedWindowPlacement(hwnd);
         UpdateOptionsMenuState(hwnd);
         LayoutControls(hwnd);
@@ -1836,6 +1941,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_AppData.sortAscending = TRUE;
             }
 
+            UpdateListSortIndicators();
             RefreshProcessList(g_AppData.hwndListView);
             return 0;
         }

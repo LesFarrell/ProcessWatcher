@@ -14,11 +14,13 @@ A lightweight Windows GUI application written in C using the Win32 API to monito
 - Shows CPU usage and last-seen timestamp for watched processes
 - Color-coded display (Green = Running, Red = Stopped)
 - Auto-refresh mode for continuous monitoring at a fixed 1-second interval
-- `File` menu with an `Exit` command
+- Status bar shows paused/auto-refresh state
+- Sort indicators in the list headers show the active sort column and direction
+- `File` menu with `Refresh Now` and `Exit`
 - `Options` menu for Auto-Refresh, Start with Windows, and Notify on Stop
 - Windows notification when a watched process stops
 - `F5` keyboard shortcut for manual refresh
-- List view right-click actions for open file location, Task Manager, end process, keep on top, and remove
+- List view right-click actions for start process, open file location, Task Manager, end process, keep on top, and remove
 - `Remove Selected` disables automatically when nothing is selected
 - Saves watched processes and `Keep On Top` state in `ProcessWatcher.ini`
 - Case-insensitive process name matching
@@ -69,11 +71,12 @@ ProcessWatcher.exe
    - **CPU %**: CPU usage for running processes
    - **Memory**: Memory usage in MB (shown when running)
    - **Last Seen**: Last observed running timestamp
-3. **Refresh**: Press `F5` to force an immediate refresh
+3. **Refresh**: Use `File -> Refresh Now` or press `F5` to force an immediate refresh
 4. **Options**: Use the `Options` menu to toggle Auto-Refresh, Start with Windows, and Notify on Stop
 5. **Remove**: Select a process in the table and click "Remove Selected" (the button is disabled when nothing is selected)
-6. **Context Menu**: Right-click a watched process to open its file location, open Task Manager, end the process, toggle Keep On Top, or remove it
-7. **File Menu**: Use `File -> Exit` to close the application
+6. **Context Menu**: Right-click a watched process to start it when its executable path is known, open its file location, open Task Manager, end the process, toggle Keep On Top, or remove it
+7. **Status Bar**: When Auto-Refresh is off, the status bar shows `Paused` so stale data is obvious
+8. **File Menu**: Use `File -> Exit` to close the application
 
 ## Notes
 
@@ -83,6 +86,7 @@ ProcessWatcher.exe
 - Process list in combo box updates automatically when the combo loses focus
 - Memory usage shown is the working set size in MB for running processes
 - CPU usage is sampled during refreshes and auto-refresh ticks
+- The `Start Process` action only becomes available after ProcessWatcher has learned the executable path for that watched process
 - The program uses Win32 API's `CreateToolhelp32Snapshot` for efficient process enumeration
 - Memory metrics are retrieved using `GetProcessMemoryInfo`
 - Auto-refresh uses a fixed 1-second window timer/message loop, avoiding a background thread shutdown race
