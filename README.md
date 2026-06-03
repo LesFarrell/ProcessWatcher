@@ -17,7 +17,7 @@ A lightweight Windows GUI application written in C using the Win32 API to monito
 - Status bar shows paused/auto-refresh state
 - Sort indicators in the list headers show the active sort column and direction
 - `File` menu with `Refresh Now` and `Exit`
-- `Options` menu for Auto-Refresh, Start with Windows, and Notify on Stop
+- `Options` menu for Auto-Refresh, Start with Windows, Notify on Stop, and Keep On Top
 - Windows notification when a watched process stops
 - `F5` keyboard shortcut for manual refresh
 - List view right-click actions for start process, open file location, Task Manager, end process, keep on top, and remove
@@ -72,7 +72,7 @@ ProcessWatcher.exe
    - **Memory**: Memory usage in MB (shown when running)
    - **Last Seen**: Last observed running timestamp
 3. **Refresh**: Use `File -> Refresh Now` or press `F5` to force an immediate refresh
-4. **Options**: Use the `Options` menu to toggle Auto-Refresh, Start with Windows, and Notify on Stop
+4. **Options**: Use the `Options` menu to toggle Auto-Refresh, Start with Windows, Notify on Stop, and Keep On Top
 5. **Remove**: Select a process in the table and click "Remove Selected" (the button is disabled when nothing is selected)
 6. **Context Menu**: Right-click a watched process to start it when its executable path is known, open its file location, open Task Manager, end the process, toggle Keep On Top, or remove it
 7. **Status Bar**: When Auto-Refresh is off, the status bar shows `Paused` so stale data is obvious

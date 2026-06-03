@@ -870,6 +870,7 @@ HMENU CreateMainWindowMenu(void)
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_START_WITH_WINDOWS, TEXT("Start with Windows"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_NOTIFY_ON_STOP, TEXT("Notify on Stop"));
+    AppendMenu(hOptionsMenu, MF_STRING, ID_CONTEXT_TOGGLE_TOPMOST, TEXT("Keep On Top"));
 
     if (!AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, TEXT("File")) ||
         !AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hOptionsMenu, TEXT("Options")))
@@ -900,6 +901,8 @@ void UpdateOptionsMenuState(HWND hwnd)
                   MF_BYCOMMAND | (g_AppData.startWithWindows ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, ID_OPTIONS_NOTIFY_ON_STOP,
                   MF_BYCOMMAND | (g_AppData.notifyOnStop ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, ID_CONTEXT_TOGGLE_TOPMOST,
+                  MF_BYCOMMAND | (IsWindowTopmost(hwnd) ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(hMenu, ID_FORCE_REFRESH,
                    MF_BYCOMMAND | (g_AppData.autoRefreshEnabled ? MF_GRAYED : MF_ENABLED));
     DrawMenuBar(hwnd);
@@ -1294,7 +1297,7 @@ void ShowGlobalContextMenu(HWND hwndOwner, POINT screenPoint)
         return;
 
     AppendMenu(hMenu, MF_STRING | (watcherTopmost ? MF_CHECKED : MF_UNCHECKED), ID_CONTEXT_TOGGLE_TOPMOST,
-               watcherTopmost ? TEXT("Turn Off Keep On Top") : TEXT("Keep On Top"));
+               TEXT("Keep On Top"));
     command = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
                              0, hwndOwner, NULL);
     DestroyMenu(hMenu);
@@ -1302,6 +1305,7 @@ void ShowGlobalContextMenu(HWND hwndOwner, POINT screenPoint)
     if (command == ID_CONTEXT_TOGGLE_TOPMOST)
     {
         ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
+        UpdateOptionsMenuState(hwndOwner);
         SaveSettingsWithFeedback(hwndOwner);
     }
 }
@@ -1515,7 +1519,7 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     AppendMenu(hMenu, endProcessFlags, ID_CONTEXT_END_PROCESS, TEXT("End Process"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING | (watcherTopmost ? MF_CHECKED : MF_UNCHECKED), ID_CONTEXT_TOGGLE_TOPMOST,
-               watcherTopmost ? TEXT("Turn Off Keep On Top") : TEXT("Keep On Top"));
+               TEXT("Keep On Top"));
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, ID_CONTEXT_REMOVE_PROCESS, TEXT("Remove Selected"));
     command = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
@@ -1533,6 +1537,7 @@ BOOL ShowListViewContextMenu(HWND hwndOwner, HWND hwndListView, POINT screenPoin
     else if (command == ID_CONTEXT_TOGGLE_TOPMOST)
     {
         ToggleWatcherTopmost(hwndOwner, !watcherTopmost);
+        UpdateOptionsMenuState(hwndOwner);
         SaveSettingsWithFeedback(hwndOwner);
     }
     else if (command == ID_CONTEXT_REMOVE_PROCESS)
@@ -1909,6 +1914,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         else if (id == ID_OPTIONS_NOTIFY_ON_STOP)
         {
             g_AppData.notifyOnStop = !g_AppData.notifyOnStop;
+            UpdateOptionsMenuState(hwnd);
+            SaveSettingsWithFeedback(hwnd);
+        }
+        else if (id == ID_CONTEXT_TOGGLE_TOPMOST)
+        {
+            ToggleWatcherTopmost(hwnd, !IsWindowTopmost(hwnd));
             UpdateOptionsMenuState(hwnd);
             SaveSettingsWithFeedback(hwnd);
         }
