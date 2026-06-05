@@ -21,7 +21,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-gcc -Wall -Wextra -Os -s -o ProcessWatcher.exe ProcessWatcher.c ProcessWatcher_res.o -lkernel32 -luser32 -lgdi32 -lpsapi -lcomctl32 -mwindows
+gcc -Wall -Wextra -Os -s -o ProcessWatcher.exe ProcessWatcher.c ProcessWatcher_res.o -lkernel32 -luser32 -lgdi32 -lpsapi -lcomctl32 -lshell32 -lcomdlg32 -mwindows
 
 if %ERRORLEVEL% EQU 0 (
     echo Compilation successful!

@@ -15,10 +15,11 @@
 #define IDC_PROCESS_NAME 1001
 #define IDC_ADD_BUTTON 1002
 #define IDC_REMOVE_BUTTON 1003
-#define IDC_PROCESS_BROWSER_BUTTON 1009
 #define IDC_LISTBOX 1004
 #define IDC_STATUS_BAR 1005
 #define IDC_EVENT_LOG_EDIT 1006
+#define IDC_PROCESS_BROWSER_LIST 1007
+#define IDC_PROCESS_BROWSER_BUTTON 1009
 #define MAX_PROCESSES 100
 #define COLUMN_COUNT 6
 #define ID_REFRESH_TIMER 1
@@ -42,8 +43,6 @@
 #define ID_FILE_LAUNCH_NEW_PROCESS 40017
 #define ID_HELP_WATCH_SYNTAX 40018
 #define ID_FILE_PROCESS_BROWSER 40019
-#define IDC_PROCESS_BROWSER_LIST 1007
-#define IDC_PROCESS_BROWSER_REFRESH 1008
 #define IDI_APP_ICON 101
 #define NOTIFICATION_ICON_ID 1
 #define SETTINGS_FILE_NAME "ProcessWatcher.ini"
@@ -2609,38 +2608,6 @@ double GetProcessCpuPercent(WatchedProcess *process, DWORD pid)
 
     CloseHandle(hProcess);
     return cpuPercent;
-}
-
-BOOL IsProcessRunning(const char *processName, DWORD *pPID, DWORD *pMemoryMB)
-{
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE)
-        return FALSE;
-
-    PROCESSENTRY32W pe32 = {0};
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-
-    if (Process32FirstW(hSnapshot, &pe32))
-    {
-        do
-        {
-            char executableName[256] = {0};
-
-            WideToUtf8(pe32.szExeFile, executableName, sizeof(executableName));
-            if (CompareUtf8Insensitive(executableName, processName) == 0)
-            {
-                if (pPID)
-                    *pPID = pe32.th32ProcessID;
-                if (pMemoryMB)
-                    *pMemoryMB = GetProcessMemoryMB(pe32.th32ProcessID);
-                CloseHandle(hSnapshot);
-                return TRUE;
-            }
-        } while (Process32NextW(hSnapshot, &pe32));
-    }
-
-    CloseHandle(hSnapshot);
-    return FALSE;
 }
 
 BOOL SaveSettingsToIni(HWND hwndOwner)
