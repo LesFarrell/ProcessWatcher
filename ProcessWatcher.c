@@ -3156,9 +3156,10 @@ HMENU CreateMainWindowMenu(void)
     AppendMenu(hFileMenu, MF_STRING, ID_FORCE_REFRESH, TEXT("Refresh Now\tF5"));
     AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hFileMenu, MF_STRING, ID_FILE_EXIT, TEXT("Exit"));
-    AppendMenu(hLogMenu, MF_STRING, ID_FILE_OPEN_EVENT_LOG_WINDOW, TEXT("Event Log Window"));
     AppendMenu(hLogMenu, MF_STRING, ID_FILE_OPEN_LOG, TEXT("Open Log File"));
     AppendMenu(hLogMenu, MF_STRING, ID_FILE_OPEN_LOG_FOLDER, TEXT("Open Log Folder"));
+    AppendMenu(hLogMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hLogMenu, MF_STRING, ID_FILE_OPEN_EVENT_LOG_WINDOW, TEXT("Event Log Window"));
     AppendMenu(hLogMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hLogMenu, MF_STRING, ID_OPTIONS_CREATE_STOP_LOGS, TEXT("Enable Logging"));
     AppendMenu(hOptionsMenu, MF_STRING, ID_OPTIONS_AUTO_REFRESH, TEXT("Auto-Refresh"));
