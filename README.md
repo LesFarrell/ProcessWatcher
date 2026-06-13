@@ -7,6 +7,7 @@ A lightweight Windows GUI application written in C using the Win32 API to monito
 ## Features
 
 - Add/remove processes to watch by name or select from combo box dropdown
+- Pick a running app by hovering its window and confirming the selection
 - Combo box shows all currently running processes for easy selection
 - Allows typing process names directly for processes not running
 - Real-time status display (RUNNING/STOPPED) with memory usage
@@ -63,7 +64,8 @@ ProcessWatcher.exe
 1. **Add Process**: 
    - **Option A**: Click the dropdown arrow in the combo box to see all running processes and select one
    - **Option B**: Type a process name directly (e.g., `notepad.exe`, `chrome.exe`) - useful for processes not currently running
-   - Then click "Add Process"
+   - **Option C**: Click `Pick Window`, move the cursor over an app window, then press `Enter`, `Space`, or click to add that process (`Esc` cancels)
+   - Then click "Add Process" when using the combo box or typed input
 2. **View Status**: The table shows all watched processes with columns:
    - **Process Name**: Name of the watched process
    - **Status**: RUNNING or STOPPED status
@@ -78,12 +80,37 @@ ProcessWatcher.exe
 7. **Status Bar**: When Auto-Refresh is off, the status bar shows `Paused` so stale data is obvious
 8. **File Menu**: Use `File -> Exit` to close the application
 
+### Watch Syntax
+
+- `notepad.exe`: watch by exact executable name
+- `chrome.exe`: another exact-name watch entry
+- `cmd:--profile-directory=Default`: watch any process whose command line contains the given text
+- `cmd:C:\Apps\MyTool\tool.exe --serve`: useful when multiple processes share the same executable name but differ by arguments
+
+## Code Layout
+
+The project is intentionally a single-file Win32 program, but the file is split into a few logical areas:
+
+- UTF-8 wrapper helpers around Win32 APIs
+- Process discovery and snapshot helpers
+- Logging, stop-reason capture, and settings persistence
+- Main window / event log / process browser UI code
+- Watch refresh flow that updates process state and redraws the list view
+
+The most important runtime path is `RefreshProcessList()`, which:
+
+1. Checks every watched entry against the current process table
+2. Updates CPU, memory, path, and command-line snapshots for running entries
+3. Emits start/stop log events and optional stop notifications
+4. Rebuilds the list view with the latest state
+
 ## Notes
 
 - Process names are case-insensitive (matching is done using Windows API)
 - Saved process names are normalized when loaded, so Windows CRLF line endings do not break matching
 - The combo box dropdown shows all currently running processes for easy selection
 - Process list in combo box updates automatically when the combo loses focus
+- `Pick Window` resolves the top-level window under the cursor to its owning PID, then adds that executable name to the watch list
 - Memory usage shown is the working set size in MB for running processes
 - CPU usage is sampled during refreshes and auto-refresh ticks
 - The `Start Process` action only becomes available after ProcessWatcher has learned the executable path for that watched process

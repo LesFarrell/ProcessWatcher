@@ -19,12 +19,15 @@
 #define IDC_STATUS_BAR 1005
 #define IDC_EVENT_LOG_EDIT 1006
 #define IDC_PROCESS_BROWSER_LIST 1007
+#define IDC_PICK_WINDOW_BUTTON 1008
 #define IDC_PROCESS_BROWSER_BUTTON 1009
 #define MAX_PROCESSES 100
 #define COLUMN_COUNT 6
 #define ID_REFRESH_TIMER 1
 #define ID_COMBO_FILTER_TIMER 2
+#define ID_WINDOW_PICKER_TIMER 3
 #define COMBO_FILTER_DELAY_MS 300
+#define WINDOW_PICKER_TIMER_MS 75
 #define ID_CONTEXT_REMOVE_PROCESS 40001
 #define ID_CONTEXT_END_PROCESS 40002
 #define ID_CONTEXT_TOGGLE_TOPMOST 40003
@@ -89,6 +92,7 @@ typedef struct
     int count;
     HWND hwndProcessCombo;
     HWND hwndAddButton;
+    HWND hwndPickWindowButton;
     HWND hwndProcessBrowserButton;
     HWND hwndRemoveButton;
     HWND hwndListView;
@@ -111,6 +115,10 @@ typedef struct
     BOOL logSortAscending;
     int processBrowserSortColumn;
     BOOL processBrowserSortAscending;
+    BOOL windowPickerActive;
+    BOOL windowPickerAwaitingButtonRelease;
+    DWORD windowPickerPid;
+    char windowPickerProcessName[256];
     RECT savedWindowRect;
     BOOL hasSavedWindowRect;
     int savedColumnWidths[COLUMN_COUNT];
@@ -150,6 +158,7 @@ void SaveSettingsWithFeedback(HWND hwndOwner);
 BOOL GetProcessExecutablePathByPid(DWORD pid, char *processPath, size_t processPathSize);
 DWORD GetProcessMemoryMB(DWORD pid);
 void UpdateStatusBar(void);
+void ToggleWindowPicker(HWND hwndOwner);
 void ApplyAutoRefreshTimer(HWND hwnd);
 BOOL SetStartWithWindowsEnabled(BOOL enabled);
 BOOL IsStartWithWindowsEnabled(void);
@@ -161,10 +170,12 @@ void UpdateListSortIndicators(void);
 BOOL EnsureNotificationIcon(HWND hwnd);
 void RemoveNotificationIcon(HWND hwnd);
 void ShowStopNotification(HWND hwnd, const char *message);
+void AddProcess(const char *processName);
 BOOL GetKnownProcessExecutablePath(const WatchedProcess *process, char *processPath, size_t processPathSize);
 void StartSelectedProcess(HWND hwndOwner);
 void LaunchNewProcess(HWND hwndOwner);
 BOOL GetProcessCommandLineByPid(DWORD pid, char *commandLine, size_t commandLineSize);
+BOOL TryGetProcessExecutableNameFromSnapshot(DWORD pid, char *processName, size_t processNameSize);
 BOOL ParseWatchInput(const char *input, int *watchMode, char *matchPattern, size_t matchPatternSize,
                      char *displayName, size_t displayNameSize);
 BOOL IsDuplicateWatchEntry(int watchMode, const char *matchPattern);
@@ -201,6 +212,15 @@ BOOL EnsureTrackedProcessHandle(WatchedProcess *process, DWORD pid);
 void CaptureTrackedProcessStopReason(WatchedProcess *process);
 void FormatStopReasonSummary(const WatchedProcess *process, char *buffer, size_t bufferSize);
 BOOL TryGetRecentApplicationErrorDetails(const WatchedProcess *process, char *buffer, size_t bufferSize);
+BOOL GetWindowPickerTarget(DWORD *pid, char *processName, size_t processNameSize);
+void UpdateWindowPickerTarget(void);
+BOOL IsWindowPickerConfirmationPressed(void);
+void HandleWindowPickerTimer(HWND hwndOwner);
+void RecordStoppedProcessEvent(const WatchedProcess *process, int *stoppedCount,
+                              char *firstStoppedProcess, size_t firstStoppedProcessSize,
+                              char *firstStopReason, size_t firstStopReasonSize);
+void UpdateRunningProcessSnapshot(WatchedProcess *process, DWORD pid, BOOL shouldLogStart);
+void AddProcessListRow(HWND hwndListView, int rowIndex, const WatchedProcess *process);
 
 BOOL Utf8ToWide(const char *input, WCHAR *output, size_t outputCount)
 {
@@ -1181,6 +1201,8 @@ BOOL ParseWatchInput(const char *input, int *watchMode, char *matchPattern, size
     TrimProcessName(workingText);
     if (_strnicmp(workingText, "cmd:", 4) == 0)
     {
+        /* `cmd:` switches the watch entry from exact executable matching to
+           substring matching against the process command line snapshot. */
         parsedMode = WATCH_MODE_COMMAND_LINE;
         patternText = workingText + 4;
     }
@@ -2542,13 +2564,51 @@ BOOL GetKnownProcessExecutablePath(const WatchedProcess *process, char *processP
            strcpy_s(processPath, processPathSize, process->executablePath) == 0;
 }
 
+BOOL TryGetProcessExecutableNameFromSnapshot(DWORD pid, char *processName, size_t processNameSize)
+{
+    HANDLE hSnapshot;
+    PROCESSENTRY32W pe32 = {0};
+
+    if (!processName || processNameSize == 0)
+        return FALSE;
+
+    processName[0] = '\0';
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    pe32.dwSize = sizeof(pe32);
+    if (!Process32FirstW(hSnapshot, &pe32))
+    {
+        CloseHandle(hSnapshot);
+        return FALSE;
+    }
+
+    do
+    {
+        if (pe32.th32ProcessID == pid)
+        {
+            WideToUtf8(pe32.szExeFile, processName, processNameSize);
+            CloseHandle(hSnapshot);
+            return processName[0] != '\0';
+        }
+    } while (Process32NextW(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+    return FALSE;
+}
+
 BOOL GetProcessExecutableNameByPid(DWORD pid, char *processName, size_t processNameSize)
 {
     char processPath[4096];
     char *baseName;
 
-    if (!GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
+    if (!processName || processNameSize == 0)
         return FALSE;
+
+    processName[0] = '\0';
+    if (!GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
+        return TryGetProcessExecutableNameFromSnapshot(pid, processName, processNameSize);
 
     baseName = strrchr(processPath, '\\');
     if (baseName)
@@ -2556,7 +2616,11 @@ BOOL GetProcessExecutableNameByPid(DWORD pid, char *processName, size_t processN
     else
         baseName = processPath;
 
-    return strcpy_s(processName, processNameSize, baseName) == 0;
+    if (strcpy_s(processName, processNameSize, baseName) == 0)
+        return TRUE;
+
+    processName[0] = '\0';
+    return FALSE;
 }
 
 double GetProcessCpuPercent(WatchedProcess *process, DWORD pid)
@@ -3273,13 +3337,161 @@ void ShowStopNotification(HWND hwnd, const char *message)
     ShellNotifyIconUtf8(NIM_MODIFY, &nid);
 }
 
+BOOL GetWindowPickerTarget(DWORD *pid, char *processName, size_t processNameSize)
+{
+    POINT cursorPos;
+    HWND hwndAtPoint;
+    DWORD targetPid = 0;
+
+    if (!pid || !processName || processNameSize == 0)
+        return FALSE;
+
+    *pid = 0;
+    processName[0] = '\0';
+
+    if (!GetCursorPos(&cursorPos))
+        return FALSE;
+
+    hwndAtPoint = WindowFromPoint(cursorPos);
+    if (!hwndAtPoint)
+        return FALSE;
+
+    hwndAtPoint = GetAncestor(hwndAtPoint, GA_ROOT);
+    if (!hwndAtPoint)
+        return FALSE;
+
+    GetWindowThreadProcessId(hwndAtPoint, &targetPid);
+    if (targetPid == 0 || targetPid == GetCurrentProcessId())
+        return FALSE;
+
+    if (!GetProcessExecutableNameByPid(targetPid, processName, processNameSize))
+        return FALSE;
+
+    *pid = targetPid;
+    return TRUE;
+}
+
+void UpdateWindowPickerTarget(void)
+{
+    DWORD pid = 0;
+    char processName[256] = {0};
+    BOOL hasTarget;
+
+    if (!g_AppData.windowPickerActive)
+        return;
+
+    hasTarget = GetWindowPickerTarget(&pid, processName, sizeof(processName));
+    if (!hasTarget)
+    {
+        pid = 0;
+        processName[0] = '\0';
+    }
+
+    if (g_AppData.windowPickerPid == pid &&
+        CompareUtf8Insensitive(g_AppData.windowPickerProcessName, processName) == 0)
+    {
+        return;
+    }
+
+    g_AppData.windowPickerPid = pid;
+    strcpy_s(g_AppData.windowPickerProcessName, sizeof(g_AppData.windowPickerProcessName), processName);
+    UpdateStatusBar();
+}
+
+BOOL IsWindowPickerConfirmationPressed(void)
+{
+    return ((GetAsyncKeyState(VK_RETURN) & 0x0001) != 0) ||
+           ((GetAsyncKeyState(VK_SPACE) & 0x0001) != 0) ||
+           ((GetAsyncKeyState(VK_LBUTTON) & 0x0001) != 0);
+}
+
+void HandleWindowPickerTimer(HWND hwndOwner)
+{
+    char pickedProcessName[256] = {0};
+
+    /* The picker is driven entirely from the UI thread timer so it can
+       follow the cursor without introducing a worker thread. */
+    UpdateWindowPickerTarget();
+
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x0001)
+    {
+        ToggleWindowPicker(hwndOwner);
+        return;
+    }
+
+    if (g_AppData.windowPickerAwaitingButtonRelease)
+    {
+        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+            return;
+
+        g_AppData.windowPickerAwaitingButtonRelease = FALSE;
+    }
+
+    if (!IsWindowPickerConfirmationPressed() ||
+        g_AppData.windowPickerPid == 0 ||
+        g_AppData.windowPickerProcessName[0] == '\0')
+    {
+        return;
+    }
+
+    strcpy_s(pickedProcessName, sizeof(pickedProcessName), g_AppData.windowPickerProcessName);
+    ToggleWindowPicker(hwndOwner);
+    AddProcess(pickedProcessName);
+}
+
+void ToggleWindowPicker(HWND hwndOwner)
+{
+    if (!hwndOwner)
+        return;
+
+    if (g_AppData.windowPickerActive)
+    {
+        KillTimer(hwndOwner, ID_WINDOW_PICKER_TIMER);
+        g_AppData.windowPickerActive = FALSE;
+        g_AppData.windowPickerAwaitingButtonRelease = FALSE;
+        g_AppData.windowPickerPid = 0;
+        g_AppData.windowPickerProcessName[0] = '\0';
+        if (g_AppData.hwndPickWindowButton)
+            SetWindowTextA(g_AppData.hwndPickWindowButton, "Pick Window");
+        UpdateStatusBar();
+        return;
+    }
+
+    g_AppData.windowPickerActive = TRUE;
+    g_AppData.windowPickerAwaitingButtonRelease = TRUE;
+    g_AppData.windowPickerPid = 0;
+    g_AppData.windowPickerProcessName[0] = '\0';
+    if (g_AppData.hwndPickWindowButton)
+        SetWindowTextA(g_AppData.hwndPickWindowButton, "Cancel Pick");
+    UpdateWindowPickerTarget();
+    UpdateStatusBar();
+    SetTimer(hwndOwner, ID_WINDOW_PICKER_TIMER, WINDOW_PICKER_TIMER_MS, NULL);
+}
+
 void UpdateStatusBar(void)
 {
-    char statusText[256];
+    char statusText[512];
     int runningCount = 0;
 
     if (!g_AppData.hwndStatusBar)
         return;
+
+    if (g_AppData.windowPickerActive)
+    {
+        if (g_AppData.windowPickerPid != 0 && g_AppData.windowPickerProcessName[0] != '\0')
+        {
+            sprintf_s(statusText, sizeof(statusText),
+                      "Pick Window: hover target, then press Enter/Space or click to add  Target: %s (PID %lu)  Esc cancels",
+                      g_AppData.windowPickerProcessName, g_AppData.windowPickerPid);
+        }
+        else
+        {
+            strcpy_s(statusText, sizeof(statusText),
+                     "Pick Window: move the cursor over another app window, then press Enter/Space or click to add  Esc cancels");
+        }
+        StatusBarSetTextUtf8(g_AppData.hwndStatusBar, 0, statusText);
+        return;
+    }
 
     for (int i = 0; i < g_AppData.count; i++)
     {
@@ -3336,6 +3548,89 @@ void RestoreSelectedProcess(HWND hwndListView, const char *processName)
     }
 }
 
+void RecordStoppedProcessEvent(const WatchedProcess *process, int *stoppedCount,
+                              char *firstStoppedProcess, size_t firstStoppedProcessSize,
+                              char *firstStopReason, size_t firstStopReasonSize)
+{
+    if (!process || !stoppedCount || !firstStoppedProcess || firstStoppedProcessSize == 0 ||
+        !firstStopReason || firstStopReasonSize == 0)
+    {
+        return;
+    }
+
+    WriteProcessStopLogEntry(process);
+    if (*stoppedCount == 0)
+    {
+        strcpy_s(firstStoppedProcess, firstStoppedProcessSize, process->name);
+        FormatStopReasonSummary(process, firstStopReason, firstStopReasonSize);
+    }
+
+    (*stoppedCount)++;
+}
+
+void UpdateRunningProcessSnapshot(WatchedProcess *process, DWORD pid, BOOL shouldLogStart)
+{
+    char processPath[MAX_PATH] = {0};
+
+    if (!process || pid == 0)
+        return;
+
+    EnsureTrackedProcessHandle(process, pid);
+    process->cpuPercent = GetProcessCpuPercent(process, pid);
+    UpdateProcessLastSeen(process);
+
+    if (GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
+        strcpy_s(process->executablePath, sizeof(process->executablePath), processPath);
+
+    if (GetProcessCommandLineByPid(pid, process->commandLine, sizeof(process->commandLine)))
+    {
+        /* Keep the last successful command line snapshot for stop logging. */
+    }
+
+    if (shouldLogStart)
+        WriteProcessStartLogEntry(process);
+}
+
+void AddProcessListRow(HWND hwndListView, int rowIndex, const WatchedProcess *process)
+{
+    char statusText[32];
+    char pidText[32];
+    char cpuText[32];
+    char memoryText[32];
+    char lastSeenText[32];
+    int index;
+
+    if (!hwndListView || !process)
+        return;
+
+    if (process->running)
+    {
+        strcpy_s(statusText, sizeof(statusText), "RUNNING");
+        sprintf_s(pidText, sizeof(pidText), "%lu", process->pid);
+        sprintf_s(cpuText, sizeof(cpuText), "%.1f%%", process->cpuPercent);
+        sprintf_s(memoryText, sizeof(memoryText), "%lu MB", process->memoryMB);
+    }
+    else
+    {
+        strcpy_s(statusText, sizeof(statusText), "STOPPED");
+        strcpy_s(pidText, sizeof(pidText), "-");
+        strcpy_s(cpuText, sizeof(cpuText), "-");
+        strcpy_s(memoryText, sizeof(memoryText), "-");
+    }
+
+    FormatProcessLastSeen(process, lastSeenText, sizeof(lastSeenText));
+
+    index = ListViewInsertItemUtf8(hwndListView, rowIndex, process->name, process->running ? 1 : 0);
+    if (index == -1)
+        return;
+
+    ListViewSetItemTextUtf8(hwndListView, index, 1, statusText);
+    ListViewSetItemTextUtf8(hwndListView, index, 2, pidText);
+    ListViewSetItemTextUtf8(hwndListView, index, 3, cpuText);
+    ListViewSetItemTextUtf8(hwndListView, index, 4, memoryText);
+    ListViewSetItemTextUtf8(hwndListView, index, 5, lastSeenText);
+}
+
 void RefreshProcessList(HWND hwndListView)
 {
     char selectedProcessName[256] = {0};
@@ -3353,12 +3648,13 @@ void RefreshProcessList(HWND hwndListView)
     SendMessage(hwndListView, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(hwndListView);
 
+    /* Refreshing does three distinct jobs: update the in-memory snapshot,
+       emit start/stop events, then rebuild the visible list view rows. */
     for (int i = 0; i < g_AppData.count; i++)
     {
         WatchedProcess previousProcess = g_AppData.processes[i];
         DWORD pid = 0;
         DWORD memoryMB = 0;
-        double cpuPercent = 0.0;
         BOOL wasRunning = previousProcess.running;
         BOOL running = IsWatchedProcessRunning(&g_AppData.processes[i], &pid, &memoryMB);
         BOOL pidChanged = wasRunning && running && previousProcess.pid != 0 && pid != 0 && previousProcess.pid != pid;
@@ -3367,13 +3663,9 @@ void RefreshProcessList(HWND hwndListView)
         {
             CloseTrackedProcessHandle(&g_AppData.processes[i]);
             CaptureTrackedProcessStopReason(&previousProcess);
-            WriteProcessStopLogEntry(&previousProcess);
-            if (stoppedCount == 0)
-            {
-                strcpy_s(firstStoppedProcess, sizeof(firstStoppedProcess), previousProcess.name);
-                FormatStopReasonSummary(&previousProcess, firstStopReason, sizeof(firstStopReason));
-            }
-            stoppedCount++;
+            RecordStoppedProcessEvent(&previousProcess, &stoppedCount,
+                                      firstStoppedProcess, sizeof(firstStoppedProcess),
+                                      firstStopReason, sizeof(firstStopReason));
             ResetProcessCpuSample(&g_AppData.processes[i]);
         }
 
@@ -3383,22 +3675,9 @@ void RefreshProcessList(HWND hwndListView)
 
         if (running)
         {
-            char processPath[MAX_PATH] = {0};
             BOOL shouldLogStart = !wasRunning || pidChanged;
 
-            EnsureTrackedProcessHandle(&g_AppData.processes[i], pid);
-            cpuPercent = GetProcessCpuPercent(&g_AppData.processes[i], pid);
-            g_AppData.processes[i].cpuPercent = cpuPercent;
-            UpdateProcessLastSeen(&g_AppData.processes[i]);
-            if (GetProcessExecutablePathByPid(pid, processPath, sizeof(processPath)))
-                strcpy_s(g_AppData.processes[i].executablePath, sizeof(g_AppData.processes[i].executablePath), processPath);
-            if (GetProcessCommandLineByPid(pid, g_AppData.processes[i].commandLine,
-                                           sizeof(g_AppData.processes[i].commandLine)))
-            {
-                /* Keep the last successful command line snapshot for stop logging. */
-            }
-            if (shouldLogStart)
-                WriteProcessStartLogEntry(&g_AppData.processes[i]);
+            UpdateRunningProcessSnapshot(&g_AppData.processes[i], pid, shouldLogStart);
         }
         else
         {
@@ -3406,13 +3685,9 @@ void RefreshProcessList(HWND hwndListView)
             {
                 CloseTrackedProcessHandle(&g_AppData.processes[i]);
                 CaptureTrackedProcessStopReason(&previousProcess);
-                WriteProcessStopLogEntry(&previousProcess);
-                if (stoppedCount == 0)
-                {
-                    strcpy_s(firstStoppedProcess, sizeof(firstStoppedProcess), previousProcess.name);
-                    FormatStopReasonSummary(&previousProcess, firstStopReason, sizeof(firstStopReason));
-                }
-                stoppedCount++;
+                RecordStoppedProcessEvent(&previousProcess, &stoppedCount,
+                                          firstStoppedProcess, sizeof(firstStoppedProcess),
+                                          firstStopReason, sizeof(firstStopReason));
             }
             else
             {
@@ -3426,44 +3701,7 @@ void RefreshProcessList(HWND hwndListView)
     SortWatchedProcesses();
 
     for (int i = 0; i < g_AppData.count; i++)
-    {
-        char statusText[32];
-        char pidText[32];
-        char cpuText[32];
-        char memoryText[32];
-        char lastSeenText[32];
-
-        if (g_AppData.processes[i].running)
-        {
-            strcpy_s(statusText, sizeof(statusText), "RUNNING");
-            sprintf_s(pidText, sizeof(pidText), "%lu", g_AppData.processes[i].pid);
-            sprintf_s(cpuText, sizeof(cpuText), "%.1f%%", g_AppData.processes[i].cpuPercent);
-            sprintf_s(memoryText, sizeof(memoryText), "%lu MB", g_AppData.processes[i].memoryMB);
-        }
-        else
-        {
-            strcpy_s(statusText, sizeof(statusText), "STOPPED");
-            strcpy_s(pidText, sizeof(pidText), "-");
-            strcpy_s(cpuText, sizeof(cpuText), "-");
-            strcpy_s(memoryText, sizeof(memoryText), "-");
-        }
-
-        FormatProcessLastSeen(&g_AppData.processes[i], lastSeenText, sizeof(lastSeenText));
-
-        {
-            int index = ListViewInsertItemUtf8(hwndListView, i,
-                                               g_AppData.processes[i].name,
-                                               g_AppData.processes[i].running ? 1 : 0);
-            if (index == -1)
-                continue;
-
-            ListViewSetItemTextUtf8(hwndListView, index, 1, statusText);
-            ListViewSetItemTextUtf8(hwndListView, index, 2, pidText);
-            ListViewSetItemTextUtf8(hwndListView, index, 3, cpuText);
-            ListViewSetItemTextUtf8(hwndListView, index, 4, memoryText);
-            ListViewSetItemTextUtf8(hwndListView, index, 5, lastSeenText);
-        }
-    }
+        AddProcessListRow(hwndListView, i, &g_AppData.processes[i]);
 
     RestoreSelectedProcess(hwndListView, selectedProcessName);
 
@@ -4059,7 +4297,7 @@ void LayoutControls(HWND hwnd)
         int statusBarTop;
         int buttonY;
         int listHeight;
-        int comboWidth = clientWidth - (margin * 5) - (buttonWidth * 3);
+        int comboWidth = clientWidth - (margin * 6) - (buttonWidth * 4);
 
         if (g_AppData.hwndStatusBar && GetWindowRect(g_AppData.hwndStatusBar, &statusRect))
             statusBarHeight = statusRect.bottom - statusRect.top;
@@ -4085,9 +4323,14 @@ void LayoutControls(HWND hwnd)
             MoveWindow(g_AppData.hwndAddButton, margin + comboWidth + margin, buttonY,
                        buttonWidth, rowHeight, TRUE);
 
+        if (g_AppData.hwndPickWindowButton)
+            MoveWindow(g_AppData.hwndPickWindowButton,
+                       margin + comboWidth + (margin * 2) + buttonWidth,
+                       buttonY, buttonWidth, rowHeight, TRUE);
+
         if (g_AppData.hwndProcessBrowserButton)
             MoveWindow(g_AppData.hwndProcessBrowserButton,
-                       margin + comboWidth + (margin * 2) + buttonWidth,
+                       margin + comboWidth + (margin * 3) + (buttonWidth * 2),
                        buttonY, buttonWidth, rowHeight, TRUE);
 
         if (g_AppData.hwndRemoveButton)
@@ -4102,7 +4345,7 @@ void LayoutControls(HWND hwnd)
 
 void GetMinimumWindowSize(HWND hwnd, int *minWidth, int *minHeight)
 {
-    RECT minClientRect = {0, 0, 560, 170};
+    RECT minClientRect = {0, 0, 700, 170};
     DWORD style = (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE);
     DWORD exStyle = (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
 
@@ -4147,15 +4390,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                                                220, 10, 130, 25,
                                                hwnd, (HMENU)IDC_ADD_BUTTON, GetModuleHandle(NULL), NULL);
 
+        g_AppData.hwndPickWindowButton = CreateWindow(TEXT("BUTTON"), TEXT("Pick Window"),
+                                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                                      360, 10, 130, 25,
+                                                      hwnd, (HMENU)IDC_PICK_WINDOW_BUTTON,
+                                                      GetModuleHandle(NULL), NULL);
+
         g_AppData.hwndProcessBrowserButton = CreateWindow(TEXT("BUTTON"), TEXT("Process Browser"),
                                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                          360, 10, 130, 25,
+                                                          500, 10, 130, 25,
                                                           hwnd, (HMENU)IDC_PROCESS_BROWSER_BUTTON,
                                                           GetModuleHandle(NULL), NULL);
 
         g_AppData.hwndRemoveButton = CreateWindow(TEXT("BUTTON"), TEXT("Remove Selected"),
                                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                  500, 10, 130, 25,
+                                                  640, 10, 130, 25,
                                                   hwnd, (HMENU)IDC_REMOVE_BUTTON, GetModuleHandle(NULL), NULL);
 
         g_AppData.hwndListView = CreateWindow(WC_LISTVIEW, TEXT(""),
@@ -4250,6 +4499,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         {
             RemoveSelectedProcess();
         }
+        else if (id == IDC_PICK_WINDOW_BUTTON)
+        {
+            ToggleWindowPicker(hwnd);
+        }
         else if (id == IDC_PROCESS_BROWSER_BUTTON)
         {
             ShowProcessBrowserWindow(hwnd);
@@ -4327,11 +4580,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
     {
         if (wParam == ID_REFRESH_TIMER)
+        {
             RefreshProcessList(g_AppData.hwndListView);
+        }
         else if (wParam == ID_COMBO_FILTER_TIMER)
         {
             KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
             ApplyComboBoxFilter(g_AppData.hwndProcessCombo);
+        }
+        else if (wParam == ID_WINDOW_PICKER_TIMER)
+        {
+            HandleWindowPickerTimer(hwnd);
         }
         return 0;
     }
@@ -4431,6 +4690,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         KillTimer(hwnd, ID_REFRESH_TIMER);
         KillTimer(hwnd, ID_COMBO_FILTER_TIMER);
+        KillTimer(hwnd, ID_WINDOW_PICKER_TIMER);
         WriteApplicationLifecycleLogEntry(FALSE);
         if (g_AppData.hwndEventLogWindow)
             DestroyWindow(g_AppData.hwndEventLogWindow);
